@@ -1,425 +1,414 @@
 """
-DCT-based invisible watermarking (frequency-domain)
-- Uses 8x8 block DCT with QIM (Quantization Index Modulation) at mid-frequency coefficient.
-- Prototype level, not claimed to be robust against all attacks.
-- Blind extraction (no original needed).
+DCT-based invisible watermarking (frequency-domain).
+
+- Watermark ids are "WM-" + 26 base32 chars derived from a 128-bit SHA-256 prefix.
+- Preserve mode (default) keeps the original PDF content: selectable text,
+  original quality and size. It adds an invisible text layer on every page and
+  watermarks each embedded raster image in place via QIM on an 8x8 DCT
+  coefficient of the image's Y channel.
+- Rasterize mode replaces every page with a watermarked 150 DPI JPEG page and is
+  robust against full re-rendering/flattening.
+- Extraction order: invisible text, per-image DCT, then rendered-page DCT; the
+  DCT payload is repetition-coded and protected by CRC32.
+- Blind extraction (no original needed); prototype-level robustness.
 """
-import io
+import base64
+import binascii
 import hashlib
+import io
+import re
+
 import numpy as np
+import pymupdf
 from PIL import Image
-import pymupdf  # fitz
-from scipy.fftpack import dct, idct
+from scipy.fftpack import dct
 
-# Constants for watermarking
-Q = 8  # quantization step — tuning invisibility vs robustness
-COEFF_POS = (3, 2)  # mid-frequency position in 8x8 DCT block (row, col)
-# Also consider (2,3) as alternative; we use single coeff for simplicity
-WATERMARK_FIXED_LEN_CHARS = 15  # "WM-" + 12 hex = 15 chars
-WATERMARK_BITS = WATERMARK_FIXED_LEN_CHARS * 8  # 120 bits
+ID_RE = re.compile(r"^WM-[A-Z2-7]{26}$")
+ID_SCAN_RE = re.compile(r"WM-[A-Z2-7]{26}")
+WATERMARK_CHARS = 26
+WATERMARK_ID_LEN = 3 + WATERMARK_CHARS
+PAYLOAD_BYTES = WATERMARK_ID_LEN + 4  # id ASCII bytes + CRC32
+WATERMARK_BITS = PAYLOAD_BYTES * 8  # 264
+REPETITION = 5
+EXTENDED_BITS = WATERMARK_BITS * REPETITION
+Q = 16  # quantization step: invisibility vs robustness
+COEFF_POS = (3, 2)  # mid-frequency position in 8x8 DCT block
 DPI = 150
-ZOOM = DPI / 72.0
+JPEG_QUALITY = 85
+MAX_TEXT_CHUNK = 8
+MODES = ("preserve", "rasterize")
+MIN_IMAGE_SIDE = 64
+MIN_IMAGE_BLOCKS = EXTENDED_BITS * 2
 
-def _dct2(block):
-    # 2D DCT using ortho norm
-    return dct(dct(block.T, norm='ortho').T, norm='ortho')
-
-def _idct2(block):
-    return idct(idct(block.T, norm='ortho').T, norm='ortho')
-
-def string_to_bits(s: str) -> list[int]:
-    bits = []
-    for ch in s.encode('utf-8'):
-        for i in range(7, -1, -1):
-            bits.append((ch >> i) & 1)
-    return bits
-
-def bits_to_string(bits: list[int]) -> str:
-    # bits length must be multiple of 8
-    chars = []
-    for i in range(0, len(bits), 8):
-        byte = 0
-        chunk = bits[i:i+8]
-        if len(chunk) < 8:
-            break
-        for b in chunk:
-            byte = (byte << 1) | b
-        chars.append(byte)
-    try:
-        return bytes(chars).decode('utf-8')
-    except:
-        return bytes(chars).decode('utf-8', errors='ignore')
 
 def generate_watermark_id(document_hash: str, recipient_id: str, session_id: str, nonce: str) -> str:
     """
-    Derive opaque watermark identifier via cryptographic hash.
-    document_hash (hex), recipient_id, session_id, nonce concatenated -> SHA256 -> WM- + 12 hex.
+    Derive an opaque 128-bit id: "WM-" + 26 base32 chars of SHA-256 over inputs.
     """
-    h = hashlib.sha256()
-    # Use canonical concatenation with separators to avoid collisions
-    h.update(document_hash.encode())
-    h.update(b"|")
-    h.update(recipient_id.upper().encode())
-    h.update(b"|")
-    h.update(session_id.encode())
-    h.update(b"|")
-    h.update(nonce.encode())
-    digest = h.hexdigest().upper()
-    return f"WM-{digest[:12]}"
+    material = f"{document_hash}|{recipient_id.upper()}|{session_id}|{nonce}".encode()
+    digest = hashlib.sha256(material).digest()[:16]
+    return "WM-" + base64.b32encode(digest).decode("ascii").rstrip("=")
 
-def _rgb_to_ycbcr(rgb: np.ndarray):
-    """
-    rgb: HxWx3 uint8
-    returns Y, Cb, Cr as float arrays
-    """
-    R = rgb[:,:,0].astype(np.float32)
-    G = rgb[:,:,1].astype(np.float32)
-    B = rgb[:,:,2].astype(np.float32)
-    Y = 0.299*R + 0.587*G + 0.114*B
-    Cb = 128 - 0.168736*R - 0.331264*G + 0.5*B
-    Cr = 128 + 0.5*R - 0.418688*G - 0.081312*B
+
+def _payload_bits(watermark_id: str) -> np.ndarray:
+    """ID bytes + big-endian CRC32, expanded with a repetition R=5 code."""
+    data = watermark_id.encode("ascii")
+    crc = binascii.crc32(data) & 0xFFFFFFFF
+    payload = data + crc.to_bytes(4, "big")
+    bits = np.unpackbits(np.frombuffer(payload, dtype=np.uint8))
+    return np.repeat(bits, REPETITION)
+
+
+def _dct2(blocks: np.ndarray) -> np.ndarray:
+    return dct(dct(blocks, axis=-1, norm="ortho"), axis=-2, norm="ortho")
+
+
+def _block_view(Y: np.ndarray) -> tuple[np.ndarray, int, int]:
+    """Split Y into an (rows, cols, 8, 8) view, zero-padding to multiples of 8."""
+    H, W = Y.shape
+    H_pad = (H + 7) // 8 * 8
+    W_pad = (W + 7) // 8 * 8
+    padded = np.zeros((H_pad, W_pad), dtype=np.float32)
+    padded[:H, :W] = Y
+    blocks = padded.reshape(H_pad // 8, 8, W_pad // 8, 8).transpose(0, 2, 1, 3)
+    return blocks, H_pad, W_pad
+
+
+def _basis(row: int, col: int) -> np.ndarray:
+    """Orthonormal DCT-II basis block for one coefficient position."""
+    idx = np.arange(8, dtype=np.float64)
+
+    def axis(k: int) -> np.ndarray:
+        if k == 0:
+            return np.full(8, 1.0 / np.sqrt(8.0))
+        return np.sqrt(2.0 / 8.0) * np.cos(np.pi * k * (2.0 * idx + 1.0) / 16.0)
+
+    return np.outer(axis(row), axis(col)).astype(np.float32)
+
+
+def _rgb_to_ycbcr(rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """rgb HxWx3 uint8 -> Y, Cb, Cr float arrays."""
+    R = rgb[:, :, 0].astype(np.float32)
+    G = rgb[:, :, 1].astype(np.float32)
+    B = rgb[:, :, 2].astype(np.float32)
+    Y = 0.299 * R + 0.587 * G + 0.114 * B
+    Cb = 128 - 0.168736 * R - 0.331264 * G + 0.5 * B
+    Cr = 128 + 0.5 * R - 0.418688 * G - 0.081312 * B
     return Y, Cb, Cr
 
-def _ycbcr_to_rgb(Y, Cb, Cr):
-    """
-    Y, Cb, Cr: float arrays HxW
-    returns rgb uint8 HxWx3
-    """
+
+def _ycbcr_to_rgb(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray) -> np.ndarray:
+    """Y, Cb, Cr float arrays -> rgb HxWx3 uint8."""
     R = Y + 1.402 * (Cr - 128)
     G = Y - 0.344136 * (Cb - 128) - 0.714136 * (Cr - 128)
     B = Y + 1.772 * (Cb - 128)
-    rgb = np.stack([R,G,B], axis=2)
-    rgb = np.clip(np.round(rgb), 0, 255).astype(np.uint8)
-    return rgb
+    rgb = np.stack([R, G, B], axis=2)
+    return np.clip(np.round(rgb), 0, 255).astype(np.uint8)
 
-def _embed_bits_in_y(Y: np.ndarray, payload_bits: list[int]) -> np.ndarray:
+
+def _apply_coeff(blocks: np.ndarray, coeff: np.ndarray, target: np.ndarray,
+                 basis: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Set COEFF_POS to target, return the rounded/clipped pixels and actual coeff."""
+    trial = np.rint(blocks + (target - coeff)[:, :, None, None] * basis).clip(0, 255)
+    actual = np.sum(trial * basis, axis=(2, 3))
+    return trial, actual
+
+
+def _embed_bits_in_y(Y: np.ndarray, bits: np.ndarray) -> np.ndarray:
     """
-    Embed payload_bits cyclically into Y channel via QIM on DCT coefficient.
-    Y: HxW float32 (0-255)
-    Returns watermarked Y'
+    Embed bits cyclically across 8x8 blocks via QIM parity on COEFF_POS.
+
+    Pixel clipping can pull the realised coefficient away from the QIM target,
+    so the target is refined until the actual coefficient is centered on the
+    nearest same-parity multiple of Q (which keeps parity stable under JPEG).
     """
-    H, W = Y.shape
-    # Pad to multiple of 8
-    H_pad = ((H + 7)//8)*8
-    W_pad = ((W + 7)//8)*8
-    Y_padded = np.zeros((H_pad, W_pad), dtype=np.float32)
-    Y_padded[:H, :W] = Y
+    blocks, H_pad, W_pad = _block_view(Y)
+    coeff = _dct2(blocks)[:, :, COEFF_POS[0], COEFF_POS[1]]
+    basis = _basis(COEFF_POS[0], COEFF_POS[1])
+    wanted = bits[np.arange(coeff.size) % bits.size].reshape(coeff.shape)
+    quant = np.rint(coeff / Q).astype(np.int64)
+    shift = np.where(coeff / Q >= quant, 1, -1)
+    quant = quant + np.where((quant & 1) != wanted, shift, 0)
+    desired = quant.astype(np.float32) * Q
+    target = desired.copy()
+    pixels, actual = _apply_coeff(blocks, coeff, target, basis)
+    for _ in range(3):
+        off = desired - actual
+        need = np.abs(off) > 0.15 * Q
+        if not need.any():
+            break
+        _, probe = _apply_coeff(blocks, coeff, target + np.where(need, Q, 0.0), basis)
+        slope = np.clip(np.where(need, (probe - actual) / Q, 1.0), 0.2, 1.0)
+        target = np.clip(target + np.where(need, off / slope, 0.0), -4096.0, 4096.0)
+        pixels, actual = _apply_coeff(blocks, coeff, target, basis)
+    wm = pixels.transpose(0, 2, 1, 3).reshape(H_pad, W_pad)
+    return wm[: Y.shape[0], : Y.shape[1]]
 
-    # We'll produce watermarked padded, then crop
-    Y_wm = np.zeros_like(Y_padded)
 
-    # Prepare blocks iteration
-    # total blocks = (H_pad/8)*(W_pad/8)
-    # Each block carries one bit cyclically
-    bit_idx = 0
-    payload_len = len(payload_bits)
+def _accumulate_votes(Y: np.ndarray, ones: np.ndarray, totals: np.ndarray) -> None:
+    """Add per-bit-position QIM votes from one page's Y channel."""
+    blocks, _, _ = _block_view(Y)
+    coeffs = _dct2(blocks)
+    coeff = coeffs[:, :, COEFF_POS[0], COEFF_POS[1]].ravel()
+    quant = np.rint(coeff / Q).astype(np.int64)
+    bits = (quant & 1).astype(bool)
+    idx = np.arange(bits.size) % EXTENDED_BITS
+    ones += np.bincount(idx[bits], minlength=EXTENDED_BITS)
+    totals += np.bincount(idx, minlength=EXTENDED_BITS)
 
-    for by in range(0, H_pad, 8):
-        for bx in range(0, W_pad, 8):
-            block = Y_padded[by:by+8, bx:bx+8]
-            # For invisibility, we could skip very flat blocks? But we embed all for robustness.
-            dct_block = _dct2(block)
-            # QIM embedding at COEFF_POS
-            coeff = dct_block[COEFF_POS[0], COEFF_POS[1]]
-            # Quantize
-            q = Q
-            quantized = int(round(coeff / q))
-            wanted_bit = payload_bits[bit_idx % payload_len]
-            # wanted: 1 => odd, 0 => even
-            # need quantized parity to match wanted
-            if (quantized & 1) != wanted_bit:
-                # adjust by 1 (towards nearest that matches parity)
-                # To minimize distortion, choose +1 or -1 based on which causes smaller error? Simple +1
-                # But if we always +1, drift positive. Alternate: if quantized==0 and wanted 1, make 1, else adjust.
-                # We'll adjust to nearest neighbor with correct parity
-                # If quantized is e.g., 4 (even) and want 1 (odd), candidates 3 and 5, choose closest to original coeff/q
-                orig_ratio = coeff / q
-                # candidates
-                c1 = quantized + 1
-                c2 = quantized - 1
-                # Ensure c1 parity matches wanted, c2 also will (since +1 flips parity)
-                # Choose candidate closer to orig_ratio
-                if abs(c1 - orig_ratio) < abs(c2 - orig_ratio):
-                    quantized = c1
-                else:
-                    quantized = c2
-                # edge case: keep within reasonable range? not needed
-            new_coeff = quantized * q
-            dct_block[COEFF_POS[0], COEFF_POS[1]] = new_coeff
-            # IDCT
-            block_wm = _idct2(dct_block)
-            Y_wm[by:by+8, bx:bx+8] = block_wm
-            bit_idx += 1
 
-    # Crop to original size
-    Y_wm_cropped = Y_wm[:H, :W]
-    # Clip Y to valid range 0-255
-    Y_wm_cropped = np.clip(Y_wm_cropped, 0, 255)
-    return Y_wm_cropped
+def _decode_votes(ones: np.ndarray, totals: np.ndarray) -> str | None:
+    """Majority-vote extended bits, undo repetition, then verify CRC32."""
+    extended = ones * 2 > totals
+    groups = extended.reshape(WATERMARK_BITS, REPETITION)
+    raw = np.packbits((groups.sum(axis=1) * 2 > REPETITION).astype(np.uint8)).tobytes()
+    id_bytes = raw[:WATERMARK_ID_LEN]
+    crc = raw[WATERMARK_ID_LEN:PAYLOAD_BYTES]
+    if (binascii.crc32(id_bytes) & 0xFFFFFFFF).to_bytes(4, "big") != crc:
+        return None
+    try:
+        watermark_id = id_bytes.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    return watermark_id if ID_RE.match(watermark_id) else None
 
-def _extract_bits_from_y(Y: np.ndarray, payload_len: int = WATERMARK_BITS) -> list[int]:
-    """
-    Blind extraction: for each 8x8 block, extract bit via quantized coefficient parity.
-    Returns majority-voted bits length payload_len.
-    """
-    H, W = Y.shape
-    H_pad = ((H + 7)//8)*8
-    W_pad = ((W + 7)//8)*8
-    Y_padded = np.zeros((H_pad, W_pad), dtype=np.float32)
-    Y_padded[:H, :W] = Y
 
-    # Collect votes per bit position
-    votes = [ [] for _ in range(payload_len) ]
-    bit_idx = 0
-    for by in range(0, H_pad, 8):
-        for bx in range(0, W_pad, 8):
-            block = Y_padded[by:by+8, bx:bx+8]
-            dct_block = _dct2(block)
-            coeff = dct_block[COEFF_POS[0], COEFF_POS[1]]
-            q = Q
-            quantized = int(round(coeff / q))
-            bit = quantized & 1  # 1 odd, 0 even
-            pos = bit_idx % payload_len
-            votes[pos].append(bit)
-            bit_idx += 1
-
-    # Majority vote per position
-    result_bits = []
-    for v in votes:
-        if not v:
-            result_bits.append(0)
+def _insert_invisible_text(page: pymupdf.Page, watermark_id: str) -> None:
+    """Insert the id at four page corners as invisible text (render mode 3)."""
+    fontsize = 6
+    margin = 12
+    text_width = pymupdf.get_text_length(watermark_id, fontname="helv", fontsize=fontsize)
+    anchors = [
+        (margin, margin + fontsize),
+        (page.rect.width - margin, margin + fontsize),
+        (margin, page.rect.height - margin),
+        (page.rect.width - margin, page.rect.height - margin),
+    ]
+    fits = text_width <= page.rect.width - 2 * margin
+    chunks = [watermark_id[i:i + MAX_TEXT_CHUNK] for i in range(0, len(watermark_id), MAX_TEXT_CHUNK)]
+    for ax, ay in anchors:
+        if fits:
+            x = margin if ax <= page.rect.width / 2 else max(margin, ax - text_width)
+            page.insert_text((x, ay), watermark_id, fontsize=fontsize, fontname="helv",
+                             render_mode=3, overlay=True)
         else:
-            # majority
-            ones = sum(v)
-            zeros = len(v) - ones
-            result_bits.append(1 if ones > zeros else 0)
-    return result_bits
+            for i, chunk in enumerate(chunks):
+                page.insert_text((margin, ay + i * (fontsize + 1)), chunk, fontsize=fontsize,
+                                 fontname="helv", render_mode=3, overlay=True)
 
-def _render_pdf_to_images(pdf_bytes: bytes, dpi: int = DPI) -> list[tuple[Image.Image, pymupdf.Rect]]:
-    """
-    Render PDF bytes to list of (PIL Image, original rect)
-    """
-    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-    images = []
-    zoom = dpi / 72.0
-    mat = pymupdf.Matrix(zoom, zoom)
-    for page in doc:
-        rect = page.rect
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        # pix.samples -> bytes
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        images.append((img, rect))
-    doc.close()
-    return images
 
-def _images_to_pdf(images: list[Image.Image], rects: list[pymupdf.Rect]) -> bytes:
-    """
-    Convert watermarked images back to PDF, preserving original page rects.
-    Uses pymupdf to insert images losslessly (PNG).
-    """
-    doc = pymupdf.open()
-    for img, rect in zip(images, rects):
-        # Create new page with same dimensions as original rect
-        page = doc.new_page(width=rect.width, height=rect.height)
-        # Convert PIL image to PNG bytes
-        buf = io.BytesIO()
-        # Save as PNG to preserve watermark (lossless)
-        img.save(buf, format="PNG")
-        png_bytes = buf.getvalue()
-        # Insert image to fill page rect
-        # Use rect as where to place image
-        page.insert_image(rect, stream=png_bytes, keep_proportion=False, overlay=True)
-    out = io.BytesIO()
-    doc.save(out)
-    doc.close()
-    return out.getvalue()
-
-def embed_watermark(pdf_bytes: bytes, watermark_id: str) -> bytes:
-    """
-    Embed watermark_id (e.g., WM-ABCDEF123456) invisibly into PDF via DCT.
-    Returns watermarked PDF bytes.
-    """
-    # Validate watermark_id length: pad or truncate to fixed length
-    # watermark_id should be exactly WATERMARK_FIXED_LEN_CHARS = 15
-    # If longer, truncate? If shorter, pad with nulls? Instead we enforce.
-    # For robustness, if not exactly 15, we will pad/truncate to 15, but keep as provided for ledger mapping.
-    # However embedding requires fixed length, so we handle variable by:
-    # - If watermark_id != 15 chars, we will embed its string as is and adjust payload_len accordingly? For simplicity enforce 15.
-    # Our generate_watermark_id always returns 15, so okay.
-    # If provided longer (e.g., WM- plus more), we truncate/pad to 15? Better to handle generically: payload bits = string_to_bits(watermark_id) but then extraction must know length.
-    # To support variable length, we will embed length header: first 8 bits encode length? But simpler to fix.
-    # We'll fix: if watermark_id length != 15, we hash it to 15 via same method? Not ideal.
-    # Instead, we will embed exactly the provided watermark_id's bits, and extraction will try to decode variable length by trying known lengths.
-    # For now, assume watermark_id is always WM- +12 hex (15 chars). Enforce.
-
-    if len(watermark_id) != WATERMARK_FIXED_LEN_CHARS:
-        # If not fixed, adjust to fixed by hashing? But to preserve exact string, we should embed variable length.
-        # For this prototype, we'll fallback to embedding variable length by first embedding length as 16 bits header.
-        # However extraction expects fixed. So we will handle variable separately: if watermark_id !=15, we will embed variable-length payload with header.
-        # For simplicity, if variable, we will use header method: payload = 16 bits length + data bits
-        # Let's implement header method for variable.
-        return _embed_variable_length(pdf_bytes, watermark_id)
-
-    payload_bits = string_to_bits(watermark_id)  # 120 bits
-    assert len(payload_bits) == WATERMARK_BITS, f"payload bits {len(payload_bits)} != {WATERMARK_BITS}"
-
-    # Render PDF to images
-    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-    watermarked_images = []
-    rects = []
+def _watermarked_page_jpeg(page: pymupdf.Page, bits: np.ndarray) -> bytes:
+    """Render one page at DPI, embed bits in the Y channel, return JPEG bytes."""
     zoom = DPI / 72.0
-    mat = pymupdf.Matrix(zoom, zoom)
-    for page in doc:
-        rect = page.rect
-        rects.append(rect)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        rgb = np.array(img)  # HxWx3 uint8
-        Y, Cb, Cr = _rgb_to_ycbcr(rgb)
-        Y_wm = _embed_bits_in_y(Y, payload_bits)
-        rgb_wm = _ycbcr_to_rgb(Y_wm, Cb, Cr)
-        img_wm = Image.fromarray(rgb_wm)
-        watermarked_images.append(img_wm)
-    doc.close()
+    pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
+    rgb = np.array(Image.frombytes("RGB", [pix.width, pix.height], pix.samples))
+    Y, Cb, Cr = _rgb_to_ycbcr(rgb)
+    rgb_wm = _ycbcr_to_rgb(_embed_bits_in_y(Y, bits), Cb, Cr)
+    buf = io.BytesIO()
+    Image.fromarray(rgb_wm).save(buf, format="JPEG", quality=JPEG_QUALITY)
+    return buf.getvalue()
 
-    # Convert back to PDF
-    out_doc = pymupdf.open()
-    for img_wm, rect in zip(watermarked_images, rects):
-        page = out_doc.new_page(width=rect.width, height=rect.height)
+
+def _embed_rasterized(doc: pymupdf.Document, watermark_id: str, bits: np.ndarray) -> bytes:
+    """Replace every page with a watermarked 150 DPI JPEG page."""
+    out = pymupdf.open()
+    try:
+        for page in doc:
+            rect = page.rect
+            jpeg = _watermarked_page_jpeg(page, bits)
+            new_page = out.new_page(width=rect.width, height=rect.height)
+            new_page.insert_image(rect, stream=jpeg, keep_proportion=False, overlay=True)
+            _insert_invisible_text(new_page, watermark_id)
         buf = io.BytesIO()
-        img_wm.save(buf, format="PNG")
-        png_bytes = buf.getvalue()
-        page.insert_image(rect, stream=png_bytes, keep_proportion=False, overlay=True)
-    out = io.BytesIO()
-    out_doc.save(out)
-    out_doc.close()
-    return out.getvalue()
+        out.save(buf, garbage=3, deflate=True)
+        return buf.getvalue()
+    finally:
+        out.close()
 
-def _embed_variable_length(pdf_bytes: bytes, watermark_id: str) -> bytes:
+
+def _collect_page_images(doc: pymupdf.Document) -> list[tuple[pymupdf.Page, int, int, int, int]]:
+    """Collect (page, xref, smask, width, height) before any replacement."""
+    collected = []
+    for page in doc:
+        for info in page.get_images(full=True):
+            xref, smask, width, height = info[0], info[1], info[2], info[3]
+            if xref > 0:
+                collected.append((page, xref, smask, width, height))
+    return collected
+
+
+def _watermark_image(info: dict, bits: np.ndarray, mask_info: dict | None = None) -> bytes | None:
+    """Watermark one extracted image; return a re-encoded stream or None."""
+    width, height = info["width"], info["height"]
+    if width < MIN_IMAGE_SIDE or height < MIN_IMAGE_SIDE:
+        return None
+    if (width // 8) * (height // 8) < MIN_IMAGE_BLOCKS:
+        return None
+    try:
+        img = Image.open(io.BytesIO(info["image"]))
+        fmt = (img.format or "").upper()
+        alpha = None
+        if mask_info is not None:
+            alpha = Image.open(io.BytesIO(mask_info["image"])).convert("L")
+        elif img.mode in ("RGBA", "LA"):
+            alpha = img.getchannel("A")
+        elif img.mode == "P" and "transparency" in img.info:
+            alpha = img.convert("RGBA").getchannel("A")
+        rgb = img.convert("RGB")
+        if alpha is not None and alpha.size != rgb.size:
+            alpha = alpha.resize(rgb.size, Image.LANCZOS)
+    except Exception:
+        return None
+    Y, Cb, Cr = _rgb_to_ycbcr(np.array(rgb))
+    out = Image.fromarray(_ycbcr_to_rgb(_embed_bits_in_y(Y, bits), Cb, Cr))
+    buf = io.BytesIO()
+    if alpha is not None:
+        out = out.convert("RGBA")
+        out.putalpha(alpha)
+        out.save(buf, format="PNG")
+    elif fmt == "PNG" or img.mode == "P":
+        out.save(buf, format="PNG")
+    else:
+        out.save(buf, format="JPEG", quality=JPEG_QUALITY)
+    return buf.getvalue()
+
+
+def _embed_preserved(doc: pymupdf.Document, watermark_id: str, bits: np.ndarray) -> bytes:
+    """Add invisible text to every page and watermark raster images in place."""
+    entries = _collect_page_images(doc)
+    mask_xrefs = {smask for _, _, smask, _, _ in entries if smask}
+    for page in doc:
+        _insert_invisible_text(page, watermark_id)
+    streams: dict[int, bytes | None] = {}
+    for page, xref, smask, _, _ in entries:
+        if xref in mask_xrefs:
+            continue
+        if xref not in streams:
+            try:
+                mask_info = doc.extract_image(smask) if smask else None
+                streams[xref] = _watermark_image(doc.extract_image(xref), bits, mask_info)
+            except Exception:
+                streams[xref] = None
+        stream = streams[xref]
+        if stream is None:
+            continue
+        try:
+            page.replace_image(xref, stream=stream)
+        except Exception:
+            continue
+    buf = io.BytesIO()
+    doc.save(buf, garbage=4, deflate=True, clean=True)
+    return buf.getvalue()
+
+
+def embed_watermark(pdf_bytes: bytes, watermark_id: str, mode: str = "preserve") -> bytes:
     """
-    Fallback for variable length watermark_id: embed length header (16 bits) + payload
+    Embed watermark_id invisibly and return the new PDF bytes.
+
+    mode="preserve" (default) keeps original pages and selectable text, adding
+    an invisible text layer plus a DCT watermark inside embedded raster images.
+    mode="rasterize" replaces every page with a watermarked JPEG page.
     """
-    # We'll embed as: 16 bits big-endian length (number of chars) + string bits
-    # But we need to know at extraction to detect header. We'll use fixed QIM but payload_len unknown.
-    # To keep extraction working, we will embed with maximum capacity and header indicates length.
-    # For embedding, we need to embed combined bits cyclically, similar to fixed.
-    # However for variable, we would need to know combined length at extraction (header gives length).
-    # Simpler: we will still use fixed 15 chars enforcement by truncating/padding, but log warning.
-    # Instead, just enforce: if watermark_id length !=15, hash it to 12 hex and recreate WM-... That's opaque but preserves mapping? No.
-    # For now, truncate or pad to 15.
-    if len(watermark_id) > WATERMARK_FIXED_LEN_CHARS:
-        watermark_id = watermark_id[:WATERMARK_FIXED_LEN_CHARS]
-    elif len(watermark_id) < WATERMARK_FIXED_LEN_CHARS:
-        watermark_id = watermark_id.ljust(WATERMARK_FIXED_LEN_CHARS, '\0')
-    payload_bits = string_to_bits(watermark_id)
-    # proceed same as fixed
-    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-    watermarked_images = []
-    rects = []
+    watermark_id = watermark_id.upper()
+    if not ID_RE.match(watermark_id):
+        raise ValueError(f"invalid watermark id: {watermark_id!r}")
+    if mode not in MODES:
+        raise ValueError(f"unknown watermark mode: {mode!r}")
+    bits = _payload_bits(watermark_id)
+    src = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        if mode == "rasterize":
+            return _embed_rasterized(src, watermark_id, bits)
+        return _embed_preserved(src, watermark_id, bits)
+    finally:
+        src.close()
+
+
+def _decode_image_bytes(image_bytes: bytes) -> str | None:
+    """Decode the CRC-checked DCT payload from one stored image stream."""
+    try:
+        rgb = np.array(Image.open(io.BytesIO(image_bytes)).convert("RGB"))
+    except Exception:
+        return None
+    Y, _, _ = _rgb_to_ycbcr(rgb)
+    ones = np.zeros(EXTENDED_BITS, dtype=np.int64)
+    totals = np.zeros(EXTENDED_BITS, dtype=np.int64)
+    _accumulate_votes(Y, ones, totals)
+    return _decode_votes(ones, totals)
+
+
+def _extract_from_images(doc: pymupdf.Document) -> str | None:
+    """Decode each unique embedded image independently via its DCT payload."""
+    seen = set()
+    for page in doc:
+        for info in page.get_images(full=True):
+            xref = info[0]
+            if xref <= 0 or xref in seen:
+                continue
+            seen.add(xref)
+            try:
+                result = _decode_image_bytes(doc.extract_image(xref)["image"])
+            except Exception:
+                result = None
+            if result:
+                return result
+    return None
+
+
+def _extract_from_rendered_pages(doc: pymupdf.Document) -> str | None:
+    """Collect QIM votes from every rendered page and decode the payload."""
+    ones = np.zeros(EXTENDED_BITS, dtype=np.int64)
+    totals = np.zeros(EXTENDED_BITS, dtype=np.int64)
     zoom = DPI / 72.0
-    mat = pymupdf.Matrix(zoom, zoom)
+    matrix = pymupdf.Matrix(zoom, zoom)
     for page in doc:
-        rect = page.rect
-        rects.append(rect)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        rgb = np.array(img)
-        Y, Cb, Cr = _rgb_to_ycbcr(rgb)
-        Y_wm = _embed_bits_in_y(Y, payload_bits)
-        rgb_wm = _ycbcr_to_rgb(Y_wm, Cb, Cr)
-        img_wm = Image.fromarray(rgb_wm)
-        watermarked_images.append(img_wm)
-    doc.close()
-    out_doc = pymupdf.open()
-    for img_wm, rect in zip(watermarked_images, rects):
-        page = out_doc.new_page(width=rect.width, height=rect.height)
-        buf = io.BytesIO()
-        img_wm.save(buf, format="PNG")
-        png_bytes = buf.getvalue()
-        page.insert_image(rect, stream=png_bytes, keep_proportion=False, overlay=True)
-    out = io.BytesIO()
-    out_doc.save(out)
-    out_doc.close()
-    return out.getvalue()
+        pix = page.get_pixmap(matrix=matrix, alpha=False)
+        rgb = np.array(Image.frombytes("RGB", [pix.width, pix.height], pix.samples))
+        Y, _, _ = _rgb_to_ycbcr(rgb)
+        _accumulate_votes(Y, ones, totals)
+    return _decode_votes(ones, totals)
+
 
 def extract_watermark(pdf_bytes: bytes) -> str | None:
     """
-    Blind extraction of watermark_id from PDF.
-    Returns watermark_id string if found and valid, else None.
-    Tries fixed length extraction and validates format WM- + hex.
+    Blind extraction: invisible text, embedded-image DCT, then page DCT.
     """
     try:
         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     except Exception:
         return None
-
-    if doc.page_count == 0:
-        doc.close()
-        return None
-
-    # We'll extract from each page and vote across pages? Simpler: extract from first page, but we watermark all pages identically,
-    # so extracting from any page should give same. For robustness, extract from all pages and majority vote per bit position across pages.
-    all_bits_per_page = []
-    zoom = DPI / 72.0
-    mat = pymupdf.Matrix(zoom, zoom)
-    for page in doc:
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        rgb = np.array(img)
-        Y, _, _ = _rgb_to_ycbcr(rgb)
-        bits = _extract_bits_from_y(Y, payload_len=WATERMARK_BITS)
-        all_bits_per_page.append(bits)
-    doc.close()
-
-    if not all_bits_per_page:
-        return None
-
-    # Combine votes across pages: per bit position, majority across pages' majority votes?
-    # Each page already did majority across blocks. Now we majority across pages.
-    final_bits = []
-    for pos in range(WATERMARK_BITS):
-        votes = [page_bits[pos] for page_bits in all_bits_per_page]
-        ones = sum(votes)
-        zeros = len(votes) - ones
-        final_bits.append(1 if ones > zeros else 0)
-
     try:
-        wm = bits_to_string(final_bits)
-        # Strip null padding if any
-        wm = wm.rstrip('\x00')
-        # Validate format: should start with "WM-" and rest hex
-        if wm.startswith("WM-"):
-            hex_part = wm[3:]
-            # Check hex chars
-            if len(hex_part) == 12 and all(c in "0123456789ABCDEFabcdef" for c in hex_part):
-                # Normalize to uppercase
-                return f"WM-{hex_part.upper()}"
-            else:
-                # Try to see if wm contains WM- pattern but with extra? Return raw if plausible
-                # For prototype, return wm if it looks like watermark
-                # But we want exact ledger match, so require exact format
-                # If not valid, maybe extraction failed
-                return None
-        else:
+        for page in doc:
+            match = ID_SCAN_RE.search(page.get_text())
+            if match:
+                return match.group(0)
+        if doc.page_count == 0:
             return None
-    except Exception:
-        return None
+        result = _extract_from_images(doc)
+        if result:
+            return result
+        return _extract_from_rendered_pages(doc)
+    finally:
+        doc.close()
+
 
 def calculate_psnr(original_pdf_bytes: bytes, watermarked_pdf_bytes: bytes) -> float:
     """
-    Estimate PSNR between original and watermarked first page for invisibility check.
+    Estimate PSNR between the first pages of the original and watermarked PDFs.
     """
     doc1 = pymupdf.open(stream=original_pdf_bytes, filetype="pdf")
     doc2 = pymupdf.open(stream=watermarked_pdf_bytes, filetype="pdf")
-    zoom = DPI / 72.0
-    mat = pymupdf.Matrix(zoom, zoom)
-    pix1 = doc1[0].get_pixmap(matrix=mat, alpha=False)
-    pix2 = doc2[0].get_pixmap(matrix=mat, alpha=False)
-    img1 = np.array(Image.frombytes("RGB", [pix1.width, pix1.height], pix1.samples)).astype(np.float32)
-    img2 = np.array(Image.frombytes("RGB", [pix2.width, pix2.height], pix2.samples)).astype(np.float32)
-    doc1.close()
-    doc2.close()
-    mse = np.mean((img1 - img2) ** 2)
+    try:
+        zoom = DPI / 72.0
+        matrix = pymupdf.Matrix(zoom, zoom)
+        pix1 = doc1[0].get_pixmap(matrix=matrix, alpha=False)
+        pix2 = doc2[0].get_pixmap(matrix=matrix, alpha=False)
+        img1 = np.array(Image.frombytes("RGB", [pix1.width, pix1.height], pix1.samples)).astype(np.float32)
+        img2 = np.array(Image.frombytes("RGB", [pix2.width, pix2.height], pix2.samples)).astype(np.float32)
+    finally:
+        doc1.close()
+        doc2.close()
+    mse = float(np.mean((img1 - img2) ** 2))
     if mse == 0:
-        return float('inf')
+        return float("inf")
     return 20 * np.log10(255.0 / np.sqrt(mse))

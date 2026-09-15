@@ -114,39 +114,45 @@ def test_complete_end_to_end_attribution():
     from backend.app.services.decryption_service import recipient_decrypt_and_watermark
     from backend.app.forensic.verify import forensic_verify
     from backend.app.ledger.ledger import clear_ledger
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    encrypted_dir = root / "storage" / "encrypted"
+    watermarked_dir = root / "storage" / "watermarked"
+
     ensure_demo_recipients()
     clear_ledger()
-    # Clean storage
-    import pathlib as pl
-    root = pl.Path(__file__).resolve().parents[2]
-    # Alternative root for test: use project root
-    import pathlib as pathlib2
-    PROJECT_ROOT = pathlib2.Path(__file__).resolve().parents[2].parents[1] if len(pathlib2.Path(__file__).resolve().parents)>3 else pathlib2.Path.cwd()
-    # Use known storage path
-    for pp in [pl.Path("/mnt/newvolume/SIH-Hackathon/PS/v1/storage/encrypted").glob("DOC-*.json")]:
-        for p in pp:
-            try: p.unlink()
-            except: pass
-    for pp in [pl.Path("/mnt/newvolume/SIH-Hackathon/PS/v1/storage/watermarked").glob("*.pdf")]:
-        for p in pp:
-            try: p.unlink()
-            except: pass
-    # Create PDF
+
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=letter)
     c.drawString(100,700,'E2E test PDF')
     c.showPage()
     c.save()
     pdf = buf.getvalue()
-    meta = encrypt_document(pdf, 'e2e.pdf', ['ALICE','BOB'])
-    doc_id = meta['document_id']
-    alice = recipient_decrypt_and_watermark(doc_id, 'ALICE')
-    bob = recipient_decrypt_and_watermark(doc_id, 'BOB')
-    assert alice['watermark_id'] != bob['watermark_id']
-    # leak Alice
-    leaked = pathlib.Path(alice['watermarked_path']).read_bytes()
-    result = forensic_verify(leaked)
-    assert result['recipient_id'] == 'ALICE'
-    assert result['signature_valid'] is True
-    assert result['ledger_valid'] is True
-    assert result['status'] == 'VERIFIED'
+
+    doc_id = None
+    watermarked_paths = []
+    try:
+        meta = encrypt_document(pdf, 'e2e.pdf', ['ALICE','BOB'], sender_id='ALICE')
+        doc_id = meta['document_id']
+        alice = recipient_decrypt_and_watermark(doc_id, 'ALICE')
+        watermarked_paths.append(pathlib.Path(alice['watermarked_path']))
+        bob = recipient_decrypt_and_watermark(doc_id, 'BOB')
+        watermarked_paths.append(pathlib.Path(bob['watermarked_path']))
+        assert alice['watermark_id'] != bob['watermark_id']
+        leaked = pathlib.Path(alice['watermarked_path']).read_bytes()
+        result = forensic_verify(leaked)
+        assert result['recipient_id'] == 'ALICE'
+        assert result['signature_valid'] is True
+        assert result['ledger_valid'] is True
+        assert result['ledger_quorum_ok'] is True
+        assert result['status'] == 'VERIFIED'
+    finally:
+        if doc_id:
+            for p in encrypted_dir.glob(f"{doc_id}.json"):
+                p.unlink(missing_ok=True)
+        for p in watermarked_paths:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+        clear_ledger()

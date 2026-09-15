@@ -18,7 +18,7 @@ import hashlib
 from backend.app.encryption.document import decrypt_document
 from backend.app.watermark.dct_watermark import generate_watermark_id, embed_watermark
 from backend.app.forensic.events import create_decryption_event, sign_event, canonical_serialize
-from backend.app.ledger.ledger import commit_event
+from backend.app.ledger.ledger import commit_event, verify_entry_quorum
 from backend.app.identity.manager import get_private_keys
 from backend.app.forensic.events import generate_session_and_nonce
 
@@ -26,7 +26,7 @@ PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[3]
 STORAGE_WATERMARKED = PROJECT_ROOT / "storage" / "watermarked"
 STORAGE_WATERMARKED.mkdir(parents=True, exist_ok=True)
 
-def recipient_decrypt_and_watermark(document_id: str, recipient_id: str) -> dict:
+def recipient_decrypt_and_watermark(document_id: str, recipient_id: str, passphrase: str = None) -> dict:
     """
     Implements the correct architecture:
         Sender -> Encrypt -> Recipient -> Decrypt -> Generate session -> Generate watermark -> Watermark/render -> Sign event -> Ledger -> Display
@@ -34,11 +34,11 @@ def recipient_decrypt_and_watermark(document_id: str, recipient_id: str) -> dict
     """
     rid = recipient_id.upper()
 
-    # 1. Authenticate (check private keys exist)
-    priv = get_private_keys(rid)  # raises if not found
+    # 1. Authenticate (unlocked or passphrase-protected private keys)
+    priv = get_private_keys(rid, passphrase)  # raises if locked/not found
 
     # 2. Decrypt PDF using ML-KEM
-    pdf_bytes, document_hash, meta = decrypt_document(document_id, rid)
+    pdf_bytes, document_hash, meta = decrypt_document(document_id, rid, passphrase)
 
     # 4-6. Generate fresh session and nonce, derive watermark
     session_id, nonce = generate_session_and_nonce()
@@ -60,11 +60,12 @@ def recipient_decrypt_and_watermark(document_id: str, recipient_id: str) -> dict
         nonce=nonce,
     )
 
-    # 7. Sign event with ML-DSA
-    signature_b64, public_key_b64 = sign_event(event, rid)
+    # 7. Sign event with ML-DSA (recipient's own private key)
+    signature_b64, public_key_b64 = sign_event(event, rid, passphrase)
 
-    # 8. Ledger commit with quorum
+    # 8. Ledger commit with per-node signing and quorum
     ledger_entry = commit_event(event, signature_b64, public_key_b64)
+    quorum = verify_entry_quorum(watermark_id)
 
     # Save watermarked document locally
     out_filename = f"{document_id}_{rid}_{session_id}.pdf"
@@ -83,6 +84,11 @@ def recipient_decrypt_and_watermark(document_id: str, recipient_id: str) -> dict
         "signature": signature_b64,
         "public_key_b64": public_key_b64,
         "ledger_entry": ledger_entry,
+        "node_quorum": {
+            "quorum_ok": quorum["quorum_ok"],
+            "valid_nodes": quorum["valid_nodes"],
+            "total_nodes": quorum["total_nodes"],
+        },
         "watermarked_path": str(out_path),
         "watermarked_bytes_len": len(watermarked_pdf),
         "timestamp": event["timestamp"],
