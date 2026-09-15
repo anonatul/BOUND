@@ -1,0 +1,33 @@
+version: "3.8"
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./ledger:/app/ledger
+      - ./storage:/app/storage
+      - ./backend/keys:/app/backend/keys
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+
+  # Prototype ledger nodes — for demonstration they are just directories mounted via the app volume.
+  # In a production system these would be separate processes. Here they share the filesystem for simplicity.
+  # The app's ledger code replicates to ledger/node1..node4 and requires quorum 3/4.
+  # No additional services needed; the 4 directories are already created.
+
+  # Optional: frontend dev server (if you prefer separate frontend container)
+  # frontend:
+  #   image: node:20-slim
+  #   working_dir: /app
+  #   volumes:
+  #     - ./frontend:/app
+  #   command: sh -c "npm install && npm run dev"
+  #   ports:
+  #     - "5173:5173"
+  #   depends_on:
+  #     - app

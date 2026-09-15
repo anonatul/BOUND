@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+.venv*/
+venv/
+env/
+.env
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Storage & Ledger (local runtime artifacts, regenerated)
+storage/watermarked/
+storage/encrypted/
+storage/uploads/
+storage/decrypted/
+ledger/*/ledger.jsonl
+# Keep ledger structure
+!ledger/*/.gitkeep
+
+# Keys (demo keys regenerated on startup; don't commit private keys)
+backend/keys/*.b64
+backend/keys/*.json
+# Keep keys folder
+!backend/keys/.gitkeep
+
+# Misc
+*.log
+*.tmp
+.opencode/
