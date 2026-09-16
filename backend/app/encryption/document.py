@@ -2,6 +2,7 @@ import os
 import json
 import hashlib
 import base64
+import mimetypes
 import pathlib
 import time
 from typing import List, Dict, Tuple
@@ -54,6 +55,10 @@ def encrypt_document(pdf_bytes: bytes, original_filename: str, authorized_recipi
     aes_key = generate_aes_key()
     nonce, ciphertext = aes_gcm_encrypt(aes_key, pdf_bytes)
 
+    filename_text = str(original_filename or "")
+    original_extension = pathlib.Path(filename_text).suffix.lower()
+    content_type = mimetypes.guess_type(filename_text)[0] or "application/octet-stream"
+
     wrapped_keys = {}
     for rid in authorized_recipients:
         r = rid.upper()
@@ -71,6 +76,8 @@ def encrypt_document(pdf_bytes: bytes, original_filename: str, authorized_recipi
     meta = {
         "document_id": doc_id,
         "original_filename": original_filename,
+        "original_extension": original_extension,
+        "content_type": content_type,
         "sender_id": sender_id.upper() if sender_id else None,
         "document_hash": doc_hash,
         "aes_nonce": b64e(nonce),

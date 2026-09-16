@@ -3,6 +3,7 @@ import { api } from '../services/api.js'
 import { formatDate } from '../services/format.js'
 import { PageHeader } from '../components/PageHeader.jsx'
 import { Copyable } from '../components/Copyable.jsx'
+import { formatLabel } from '../services/fileTypes.js'
 
 const PANEL_TITLES = {
   verified: 'Copy attributed',
@@ -134,7 +135,7 @@ export function Verify({ onOpenDocument, onOpenAudit }) {
   const handleSubmit = async (event) => {
     event.preventDefault()
     if (!file) {
-      setError('Choose a PDF file to verify.')
+      setError('Choose a file to verify.')
       return
     }
 
@@ -156,7 +157,7 @@ export function Verify({ onOpenDocument, onOpenAudit }) {
     <div>
       <PageHeader
         title="Verify"
-        description="Check whether a copy of a shared PDF matches the audit ledger."
+        description="Check whether a copy of a shared file matches the audit ledger."
       />
 
       <section className="card">
@@ -167,12 +168,11 @@ export function Verify({ onOpenDocument, onOpenAudit }) {
 
         <form onSubmit={handleSubmit}>
           <div className="field">
-            <label htmlFor="verify-file">PDF file</label>
+            <label htmlFor="verify-file">File</label>
             <input
               id="verify-file"
               className="input"
               type="file"
-              accept="application/pdf"
               disabled={loading}
               onChange={(event) =>
                 setFile(event.target.files && event.target.files[0] ? event.target.files[0] : null)
@@ -202,6 +202,9 @@ export function Verify({ onOpenDocument, onOpenAudit }) {
           </div>
           <p>{outcomeText(result, kind)}</p>
           <p className="muted">{adviceText(kind)}</p>
+          {result.format ? (
+            <p className="muted">Analyzed as: {formatLabel(result.format)}.</p>
+          ) : null}
 
           <div className="check-list">
             <CheckRow label="Watermark detected" value={result.watermark_detected} />

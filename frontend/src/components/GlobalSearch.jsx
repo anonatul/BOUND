@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../services/api.js'
 import { useDebouncedValue } from '../hooks/useDebouncedValue.js'
+import { FileTypeBadge } from './FileTypeBadge.jsx'
 
 const MIN_QUERY = 2
 const GROUP_LIMIT = 5
@@ -139,7 +140,10 @@ export function GlobalSearch({ onSelect }) {
                     pick({ kind: 'document', document_id: doc.document_id, role: doc.role })
                   }
                 >
-                  <span>{doc.original_filename || 'Untitled'}</span>
+                  <span className="global-item-title">
+                    <FileTypeBadge name={doc.original_filename} />
+                    <span>{doc.original_filename || 'Untitled'}</span>
+                  </span>
                   <span className="global-item-sub mono">
                     {doc.document_id} | {doc.role === 'owner' ? 'Shared by me' : 'Shared with me'}
                   </span>

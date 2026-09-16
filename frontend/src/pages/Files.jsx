@@ -12,7 +12,9 @@ import { EmptyState } from '../components/EmptyState.jsx'
 import { Pagination } from '../components/Pagination.jsx'
 import { RecipientPicker } from '../components/RecipientPicker.jsx'
 import { DropZone } from '../components/DropZone.jsx'
+import { FileTypeBadge } from '../components/FileTypeBadge.jsx'
 import { useToast } from '../components/Toasts.jsx'
+import { fileTypeLabel } from '../services/fileTypes.js'
 
 export function Files({ user, focus, onFocusHandled }) {
   const toast = useToast()
@@ -206,7 +208,7 @@ export function Files({ user, focus, onFocusHandled }) {
   const handleShare = async (event) => {
     event.preventDefault()
     if (!file) {
-      setShareError('Choose a PDF file to share.')
+      setShareError('Choose a file to share.')
       return
     }
     if (selected.length === 0) {
@@ -253,7 +255,12 @@ export function Files({ user, focus, onFocusHandled }) {
         key: 'original_filename',
         label: 'Name',
         sortable: true,
-        render: (doc) => doc.original_filename || 'Untitled',
+        render: (doc) => (
+          <span className="name-cell">
+            <FileTypeBadge name={doc.original_filename} />
+            <span>{doc.original_filename || 'Untitled'}</span>
+          </span>
+        ),
       },
       {
         key: 'document_id',
@@ -301,7 +308,7 @@ export function Files({ user, focus, onFocusHandled }) {
     <div>
       <PageHeader
         title="Files"
-        description="Share PDFs and manage the documents you own."
+        description="Share files and manage the documents you own."
         action={
           <button type="button" className="btn primary" onClick={focusShareForm}>
             New share
@@ -313,14 +320,18 @@ export function Files({ user, focus, onFocusHandled }) {
         <div className="card-head">
           <h2>Share a document</h2>
         </div>
-        <p className="muted">Upload a PDF and choose the people who may decrypt it.</p>
+        <p className="muted">Upload a file and choose the people who may decrypt it.</p>
+        <p className="muted hint">
+          PDFs, images, text, CSV/JSON, and Word/Excel/PowerPoint files are watermarked natively.
+          Other file types are delivered in a forensic ZIP container.
+        </p>
 
         {prefill ? (
           <div className="panel">
             <div className="card-head">
               <p className="muted">
                 Sharing another copy of <span className="mono">{prefill.filename}</span>. Choose the
-                same PDF and people below.
+                same file and people below.
               </p>
               <button type="button" className="link-btn" onClick={() => setPrefill(null)}>
                 Clear
@@ -331,7 +342,7 @@ export function Files({ user, focus, onFocusHandled }) {
 
         <form onSubmit={handleShare}>
           <div className="field">
-            <label htmlFor="share-file">PDF file</label>
+            <label htmlFor="share-file">File</label>
             <DropZone id="share-file" file={file} onFile={setFile} disabled={sharing} />
           </div>
 
@@ -366,7 +377,7 @@ export function Files({ user, focus, onFocusHandled }) {
               </>
             ) : (
               <p className="muted">
-                {!file ? 'Choose a PDF file.' : 'Select at least one recipient.'}
+                {!file ? 'Choose a file.' : 'Select at least one recipient.'}
               </p>
             )}
           </div>
@@ -465,7 +476,7 @@ export function Files({ user, focus, onFocusHandled }) {
         {!documentsLoading && !documentsError && ownedDocuments.length === 0 ? (
           <EmptyState
             title="No documents yet"
-            message="Use the form above to share your first PDF."
+            message="Use the form above to share your first file."
             actionLabel="New share"
             onAction={focusShareForm}
           />
@@ -532,6 +543,8 @@ export function Files({ user, focus, onFocusHandled }) {
               <dd>
                 <Copyable value={activeDoc.document_hash} label="document hash" />
               </dd>
+              <dt>File type</dt>
+              <dd>{fileTypeLabel(activeDoc.original_filename)}</dd>
               <dt>Status</dt>
               <dd>
                 <span className="badge">{activeDoc.status || 'stored'}</span>

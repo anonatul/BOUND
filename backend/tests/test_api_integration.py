@@ -1,6 +1,8 @@
 import io
 import json
+import mimetypes
 import pathlib
+import zipfile
 
 from fastapi.testclient import TestClient
 
@@ -23,6 +25,47 @@ def _pdf(title="Integration test document"):
     c.showPage()
     c.save()
     return buf.getvalue()
+
+
+def _png():
+    import numpy as np
+    from PIL import Image
+
+    rng = np.random.default_rng(20260916)
+    pixels = rng.integers(50, 210, size=(480, 640, 3), dtype=np.uint8)
+    buf = io.BytesIO()
+    Image.fromarray(pixels, mode="RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _docx():
+    content_types = (
+        '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/word/document.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>'
+    )
+    document = (
+        '<?xml version="1.0"?><w:document '
+        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>'
+        '<w:p><w:r><w:t>Hello integration</w:t></w:r></w:p></w:body></w:document>'
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("word/document.xml", document)
+    return buf.getvalue()
+
+
+def _multi_format_cases():
+    return [
+        ("notes.txt", b"quarterly notes\nsecond line\n", "text", ".txt"),
+        ("table.csv", b"name,score\nalice,1\nbob,2\n", "text", ".csv"),
+        ("payload.json", b'{"user": "alice", "role": "admin"}', "text", ".json"),
+        ("image.png", _png(), "image", ".png"),
+        ("report.docx", _docx(), "ooxml", ".docx"),
+        ("blob.bin", bytes(range(256)) * 8, "container", ".zip"),
+    ]
 
 
 def _cleanup_user():
@@ -187,18 +230,60 @@ def test_full_api_flow():
             assert e2e.json()["passed"] is True
             e2e_body = e2e.json()
             e2e_doc_id = e2e_body.get("document_id")
-            for key, rid in (("alice", "ALICE"), ("bob", "BOB")):
-                session = (e2e_body.get(key) or {}).get("session")
-                if e2e_doc_id and session:
-                    e2e_files.append(STORAGE_WATERMARKED / f"{e2e_doc_id}_{rid}_{session}.pdf")
+            if e2e_doc_id:
+                for rid in ("ALICE", "BOB"):
+                    e2e_files.extend(STORAGE_WATERMARKED.glob(f"{e2e_doc_id}_{rid}_*"))
+
+            for name, payload, expected_format, expected_suffix in _multi_format_cases():
+                upload = client.post(
+                    "/api/encrypt",
+                    headers=headers,
+                    files={"file": (name, payload, "application/octet-stream")},
+                    data={"recipients": json.dumps([USERNAME])},
+                )
+                assert upload.status_code == 200, upload.text
+                upload_body = upload.json()
+                assert upload_body["original_extension"] == pathlib.Path(name).suffix
+                assert upload_body["content_type"]
+
+                decrypted = client.post(
+                    "/api/decrypt", headers=headers, json={"document_id": upload_body["document_id"]}
+                )
+                assert decrypted.status_code == 200, decrypted.text
+                decrypted_body = decrypted.json()
+                assert decrypted_body["recipient_id"] == USERNAME
+                assert decrypted_body["filename"].endswith(expected_suffix), (
+                    name, decrypted_body["filename"], expected_suffix,
+                )
+                assert decrypted_body["output_format"] == expected_format, (
+                    name, decrypted_body["output_format"], expected_format,
+                )
+
+                download = client.get(decrypted_body["download_url"])
+                assert download.status_code == 200, download.text
+                expected_content_type = (
+                    mimetypes.guess_type(decrypted_body["filename"])[0] or "application/octet-stream"
+                )
+                assert download.headers["content-type"].split(";")[0] == expected_content_type
+
+                verdict = client.post(
+                    "/api/verify",
+                    files={"file": (decrypted_body["filename"], download.content, "application/octet-stream")},
+                )
+                assert verdict.status_code == 200, verdict.text
+                result = verdict.json()
+                assert result["status"] == "VERIFIED", (name, result["status"], result.get("message"))
+                assert result["recipient_id"] == USERNAME
+                assert result["signature_valid"] is True
+                assert result["ledger_quorum_ok"] is True
+                assert result["format"] == expected_format, (name, result["format"], expected_format)
 
             logout = client.post("/api/auth/logout", headers=headers)
             assert logout.status_code == 200
             assert client.get("/api/auth/me", headers=headers).status_code == 401
     finally:
         _cleanup_user()
-        clear_ledger()
-        for path in STORAGE_WATERMARKED.glob(f"DOC-*_{USERNAME}_*.pdf"):
+        for path in STORAGE_WATERMARKED.glob(f"DOC-*_{USERNAME}_*"):
             try:
                 path.unlink()
             except OSError:
@@ -216,3 +301,4 @@ def test_full_api_flow():
                 path.unlink(missing_ok=True)
             except OSError:
                 pass
+        clear_ledger()

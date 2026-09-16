@@ -1,7 +1,8 @@
 import { useRef, useState } from 'react'
 import { formatBytes } from '../services/format.js'
+import { FileTypeBadge } from './FileTypeBadge.jsx'
 
-export function DropZone({ id, file, onFile, disabled, accept = 'application/pdf' }) {
+export function DropZone({ id, file, onFile, disabled }) {
   const inputRef = useRef(null)
   const [dragActive, setDragActive] = useState(false)
 
@@ -37,7 +38,6 @@ export function DropZone({ id, file, onFile, disabled, accept = 'application/pdf
         ref={inputRef}
         className="visually-hidden-file"
         type="file"
-        accept={accept}
         disabled={disabled}
         onChange={(event) => acceptFiles(event.target.files)}
       />
@@ -45,7 +45,10 @@ export function DropZone({ id, file, onFile, disabled, accept = 'application/pdf
       {file ? (
         <div className="dropzone-file">
           <div className="dropzone-file-info">
-            <span className="dropzone-name">{file.name}</span>
+            <span className="dropzone-file-main">
+              <FileTypeBadge name={file.name} />
+              <span className="dropzone-name">{file.name}</span>
+            </span>
             <span className="muted">{formatBytes(file.size)}</span>
           </div>
           <div className="row-actions">
@@ -64,8 +67,8 @@ export function DropZone({ id, file, onFile, disabled, accept = 'application/pdf
         </div>
       ) : (
         <label className="dropzone-empty" htmlFor={id}>
-          <span>Drag a PDF here or click to browse</span>
-          <span className="muted">PDF files only</span>
+          <span>Drag a file here or click to browse</span>
+          <span className="muted">Any file type</span>
         </label>
       )}
     </div>

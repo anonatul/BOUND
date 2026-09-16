@@ -14,12 +14,12 @@ Forensic verification pipeline:
 import hashlib
 from typing import Dict, Optional
 
-from backend.app.watermark.dct_watermark import extract_watermark
+from backend.app.watermark import formats
 from backend.app.ledger.ledger import find_by_watermark, verify_all_ledgers, verify_entry_quorum, get_all_entries
 from backend.app.forensic.events import canonical_serialize, verify_event_with_provided_pk
 from backend.app.identity.manager import get_public_keys
 
-def forensic_verify(leaked_pdf_bytes: bytes) -> Dict:
+def forensic_verify(leaked_bytes: bytes, filename: Optional[str] = None) -> Dict:
     """
     Returns detailed verification result:
     {
@@ -31,11 +31,14 @@ def forensic_verify(leaked_pdf_bytes: bytes) -> Dict:
         "timestamp": ...,
         "signature_valid": bool,
         "ledger_valid": bool,
+        "format": "pdf" | "image" | "text" | "ooxml" | "container",
         "details": {...}
     }
     """
+    leaked = bytes(leaked_bytes) if leaked_bytes is not None else b""
     result = {
-        "leaked_hash": hashlib.sha256(leaked_pdf_bytes).hexdigest(),
+        "leaked_hash": hashlib.sha256(leaked).hexdigest(),
+        "format": None,
         "watermark_id": None,
         "watermark_detected": False,
         "ledger_match_found": False,
@@ -52,8 +55,14 @@ def forensic_verify(leaked_pdf_bytes: bytes) -> Dict:
         "message": "",
     }
 
-    # Step 2: Extract watermark
-    watermark_id = extract_watermark(leaked_pdf_bytes)
+    # Step 1b: Classify the leaked artifact with the format dispatcher
+    try:
+        result["format"] = formats.handler_kind(filename, leaked)
+    except Exception:
+        result["format"] = None
+
+    # Step 2: Extract watermark (filename selects the handler; None sniffs)
+    watermark_id = formats.extract_watermark(leaked, filename)
     if not watermark_id:
         result["status"] = "NO_WATERMARK"
         result["message"] = "No forensic watermark detected in the leaked document."
@@ -145,10 +154,10 @@ def forensic_verify(leaked_pdf_bytes: bytes) -> Dict:
 
     return result
 
-def verify_watermark_extraction_only(pdf_bytes: bytes) -> Dict:
-    wm = extract_watermark(pdf_bytes)
+def verify_watermark_extraction_only(data: bytes, filename: Optional[str] = None) -> Dict:
+    wm = formats.extract_watermark(data, filename)
     return {
         "watermark_id": wm,
         "detected": wm is not None,
-        "hash": hashlib.sha256(pdf_bytes).hexdigest()
+        "hash": hashlib.sha256(data).hexdigest()
     }

@@ -10,8 +10,10 @@ import { DetailDrawer } from '../components/DetailDrawer.jsx'
 import { Copyable } from '../components/Copyable.jsx'
 import { EmptyState } from '../components/EmptyState.jsx'
 import { Pagination } from '../components/Pagination.jsx'
+import { FileTypeBadge } from '../components/FileTypeBadge.jsx'
 import { UnlockDialog } from '../components/UnlockDialog.jsx'
 import { useToast } from '../components/Toasts.jsx'
+import { fileTypeLabel, isZipName } from '../services/fileTypes.js'
 
 function ownerOf(doc) {
   return doc.owner || doc.owner_id || doc.owner_recipient_id || doc.sender_id || doc.sender || 'Unknown'
@@ -144,7 +146,12 @@ export function SharedWithMe({ unlocked, focus, onFocusHandled, onSessionChanged
       key: 'original_filename',
       label: 'Name',
       sortable: true,
-      render: (doc) => doc.original_filename || 'Untitled',
+      render: (doc) => (
+        <span className="name-cell">
+          <FileTypeBadge name={doc.original_filename} />
+          <span>{doc.original_filename || 'Untitled'}</span>
+        </span>
+      ),
     },
     {
       key: 'document_id',
@@ -326,6 +333,21 @@ export function SharedWithMe({ unlocked, focus, onFocusHandled, onSessionChanged
               <dd>
                 <Copyable value={result.watermark_id} label="watermark ID" />
               </dd>
+              {result.filename ? (
+                <>
+                  <dt>Output</dt>
+                  <dd>
+                    <span className="name-cell">
+                      <FileTypeBadge name={result.filename} />
+                      <span>
+                        {isZipName(result.filename)
+                          ? 'Wrapped in a forensic ZIP container'
+                          : 'Native watermarked copy'}
+                      </span>
+                    </span>
+                  </dd>
+                </>
+              ) : null}
               {result.ledger ? (
                 <>
                   <dt>Audit</dt>
@@ -382,6 +404,8 @@ export function SharedWithMe({ unlocked, focus, onFocusHandled, onSessionChanged
               <dd>
                 <Copyable value={activeDoc.document_hash} label="document hash" />
               </dd>
+              <dt>File type</dt>
+              <dd>{fileTypeLabel(activeDoc.original_filename)}</dd>
               <dt>Owner</dt>
               <dd>{ownerOf(activeDoc)}</dd>
               <dt>Shared on</dt>

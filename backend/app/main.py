@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import io
 import json
+import mimetypes
 import os
 import pathlib
 import time
@@ -43,7 +44,7 @@ from backend.app.ledger.ledger import (
     verify_entry_quorum,
 )
 from backend.app.services.decryption_service import recipient_decrypt_and_watermark
-from backend.app.watermark.dct_watermark import extract_watermark
+from backend.app.watermark import formats
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
 STORAGE_WATERMARKED = PROJECT_ROOT / "storage" / "watermarked"
@@ -288,15 +289,18 @@ async def encrypt_endpoint(
 
     if not rec_list:
         raise HTTPException(status_code=400, detail="At least one recipient required")
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
 
-    pdf_bytes = await file.read()
-    if len(pdf_bytes) == 0:
+    filename = (file.filename or "").strip()
+    extension = pathlib.Path(filename).suffix
+    if not filename or not extension or extension == ".":
+        raise HTTPException(status_code=400, detail="File name must include an extension")
+
+    file_bytes = await file.read()
+    if len(file_bytes) == 0:
         raise HTTPException(status_code=400, detail="Empty file")
 
     try:
-        meta = encrypt_document(pdf_bytes, file.filename, rec_list, sender_id=user["recipient_id"])
+        meta = encrypt_document(file_bytes, filename, rec_list, sender_id=user["recipient_id"])
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -306,11 +310,16 @@ async def encrypt_endpoint(
         "document_id": meta["document_id"],
         "document_hash": meta["document_hash"],
         "original_filename": meta["original_filename"],
+        "original_extension": meta.get("original_extension"),
+        "content_type": meta.get("content_type"),
         "sender_id": meta.get("sender_id"),
         "authorized_recipients": meta["authorized_recipients"],
         "ciphertext_len": meta["ciphertext_len"],
         "status": "ENCRYPTED",
-        "message": f"Document {meta['document_id']} encrypted and stored.",
+        "message": (
+            f"Document {meta['document_id']} encrypted and stored; "
+            f"decryption emits the original file format."
+        ),
     }
 
 
@@ -346,6 +355,8 @@ async def list_documents(user: dict = Depends(get_current_user)):
         docs.append({
             "document_id": meta["document_id"],
             "original_filename": meta.get("original_filename"),
+            "original_extension": meta.get("original_extension"),
+            "content_type": meta.get("content_type"),
             "document_hash": meta.get("document_hash"),
             "sender_id": sender,
             "owner": sender or "Unknown",
@@ -466,6 +477,9 @@ async def decrypt_endpoint(req: DecryptRequest, user: dict = Depends(get_current
         "ledger_status": f"COMMITTED ({len(result['node_quorum']['valid_nodes'])}/4 nodes)",
         "download_url": download_url,
         "filename": filename,
+        "content_type": mimetypes.guess_type(filename)[0] or "application/octet-stream",
+        "output_format": result.get("output_format"),
+        "original_filename": result.get("original_filename"),
         "message": "Decryption successful. Watermark generated and ledger committed.",
     }
 
@@ -490,14 +504,22 @@ async def download_watermarked(
     elif not _bearer_token(authorization) or auth_service.get_session(_bearer_token(authorization)) is None:
         raise HTTPException(status_code=401, detail="A valid download token or session is required")
 
-    return FileResponse(path, media_type="application/pdf", filename=safe_name)
+    media_type = mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
+    return FileResponse(path, media_type=media_type, filename=safe_name)
 
 
 @app.get("/api/watermarked")
 async def list_watermarked():
-    files = list(STORAGE_WATERMARKED.glob("*.pdf"))
+    files = sorted(f for f in STORAGE_WATERMARKED.iterdir() if f.is_file())
     return {
-        "files": [{"filename": f.name, "size": f.stat().st_size} for f in files],
+        "files": [
+            {
+                "filename": f.name,
+                "size": f.stat().st_size,
+                "content_type": mimetypes.guess_type(f.name)[0] or "application/octet-stream",
+            }
+            for f in files
+        ],
         "count": len(files),
     }
 
@@ -557,17 +579,17 @@ async def ledger_verify():
 
 @app.post("/api/verify")
 async def verify_endpoint(file: UploadFile = File(...), user: Optional[dict] = Depends(get_current_user_optional)):
-    pdf_bytes = await file.read()
-    if len(pdf_bytes) == 0:
+    file_bytes = await file.read()
+    if len(file_bytes) == 0:
         raise HTTPException(status_code=400, detail="Empty file")
-    return forensic_verify(pdf_bytes)
+    return forensic_verify(file_bytes, file.filename)
 
 
 @app.post("/api/verify/watermark-only")
 async def verify_watermark_only(file: UploadFile = File(...), user: Optional[dict] = Depends(get_current_user_optional)):
-    pdf_bytes = await file.read()
-    wm = extract_watermark(pdf_bytes)
-    return {"watermark_id": wm, "detected": wm is not None}
+    file_bytes = await file.read()
+    watermark_id = formats.extract_watermark(file_bytes, file.filename)
+    return {"watermark_id": watermark_id, "detected": watermark_id is not None}
 
 
 # --- Security demonstrations ---
