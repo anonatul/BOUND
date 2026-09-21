@@ -37,13 +37,16 @@ def create_decryption_event(document_id: str, document_hash: str, recipient_id: 
     }
     return event
 
-def sign_event(event: Dict, recipient_id: str) -> tuple[str, str]:
+def sign_event(event: Dict, recipient_id: str, passphrase: str = None) -> tuple[str, str]:
     """
     Sign canonical event using recipient's ML-DSA private key.
     Returns (signature_b64, public_key_b64_ref) . Uses real ML-DSA, not RSA/ECDSA.
+
+    For passphrase-protected accounts the key must be unlocked first or the
+    passphrase supplied; otherwise PermissionError is raised.
     """
     rid = recipient_id.upper()
-    priv = get_private_keys(rid)
+    priv = get_private_keys(rid, passphrase)
     pub = get_public_keys(rid)
     variant = pub.get("mldsa_variant", "65")
     canon = canonical_serialize(event)
@@ -79,7 +82,7 @@ def generate_session_and_nonce() -> tuple[str, str]:
     nonce = os.urandom(16).hex().upper()
     return session_id, nonce
 
-def create_and_sign_event(document_id: str, document_hash: str, recipient_id: str) -> Dict:
+def create_and_sign_event(document_id: str, document_hash: str, recipient_id: str, passphrase: str = None) -> Dict:
     """
     Full flow: generate session, nonce, watermark, create event, sign.
     Returns dict with event, signature, watermark_id, session_id, nonce
@@ -88,7 +91,7 @@ def create_and_sign_event(document_id: str, document_hash: str, recipient_id: st
     session_id, nonce = generate_session_and_nonce()
     watermark_id = generate_watermark_id(document_hash, recipient_id, session_id, nonce)
     event = create_decryption_event(document_id, document_hash, recipient_id, session_id, watermark_id, nonce)
-    sig_b64, pk_b64 = sign_event(event, recipient_id)
+    sig_b64, pk_b64 = sign_event(event, recipient_id, passphrase)
     return {
         "event": event,
         "signature": sig_b64,

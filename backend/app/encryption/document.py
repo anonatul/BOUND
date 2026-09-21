@@ -2,6 +2,7 @@ import os
 import json
 import hashlib
 import base64
+import mimetypes
 import pathlib
 import time
 from typing import List, Dict, Tuple
@@ -30,7 +31,7 @@ def generate_document_id() -> str:
     next_n = max(nums)+1 if nums else 1
     return f"DOC-{next_n:03d}"
 
-def encrypt_document(pdf_bytes: bytes, original_filename: str, authorized_recipients: List[str]) -> Dict:
+def encrypt_document(pdf_bytes: bytes, original_filename: str, authorized_recipients: List[str], sender_id: str = None) -> Dict:
     """
     1. Calculates SHA-256 hash of original PDF.
     2. Generates random AES-256 key.
@@ -54,6 +55,10 @@ def encrypt_document(pdf_bytes: bytes, original_filename: str, authorized_recipi
     aes_key = generate_aes_key()
     nonce, ciphertext = aes_gcm_encrypt(aes_key, pdf_bytes)
 
+    filename_text = str(original_filename or "")
+    original_extension = pathlib.Path(filename_text).suffix.lower()
+    content_type = mimetypes.guess_type(filename_text)[0] or "application/octet-stream"
+
     wrapped_keys = {}
     for rid in authorized_recipients:
         r = rid.upper()
@@ -71,6 +76,9 @@ def encrypt_document(pdf_bytes: bytes, original_filename: str, authorized_recipi
     meta = {
         "document_id": doc_id,
         "original_filename": original_filename,
+        "original_extension": original_extension,
+        "content_type": content_type,
+        "sender_id": sender_id.upper() if sender_id else None,
         "document_hash": doc_hash,
         "aes_nonce": b64e(nonce),
         "ciphertext": b64e(ciphertext),
@@ -105,7 +113,7 @@ def load_encrypted_document(document_id: str) -> Dict:
         raise FileNotFoundError(f"Document {document_id} not found")
     return json.loads(path.read_text())
 
-def decrypt_document(document_id: str, recipient_id: str) -> Tuple[bytes, str, Dict]:
+def decrypt_document(document_id: str, recipient_id: str, passphrase: str = None) -> Tuple[bytes, str, Dict]:
     """
     Decrypt document for recipient.
     Returns (pdf_bytes, document_hash, metadata)
@@ -116,7 +124,7 @@ def decrypt_document(document_id: str, recipient_id: str) -> Tuple[bytes, str, D
     if rid not in meta["wrapped_keys"]:
         raise PermissionError(f"Recipient {rid} not authorized for {document_id}")
 
-    priv = get_private_keys(rid)
+    priv = get_private_keys(rid, passphrase)
     wrapped = meta["wrapped_keys"][rid]
     kem_ct = b64d(wrapped["kem_ciphertext"])
     wrap_nonce = b64d(wrapped["wrapped_key_nonce"])

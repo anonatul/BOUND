@@ -29,6 +29,10 @@ storage/encrypted/
 storage/uploads/
 storage/decrypted/
 ledger/*/ledger.jsonl
+ledger/*/checkpoints.jsonl
+ledger/*/node_mldsa_pk.b64
+ledger/*/node_mldsa_sk.b64
+backend/data/
 # Keep ledger structure
 !ledger/*/.gitkeep
 
