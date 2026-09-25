@@ -202,11 +202,64 @@ docker compose up --build
 
 - **Entry:** `{seq, event, signature (recipient), public_key_b64, previous_hash, current_hash, timestamp, node_id, node_signature, denormalized document/recipient/session/watermark ids}`.
 - `current_hash = SHA256(canonical_event + recipient_signature + previous_hash)`.
-- **Node signing:** each of the 4 nodes holds its own ML-DSA-65 keypair (`ledger/nodeN/node_mldsa_*.b64`) and signs a canonical core of every entry. Node signatures differ per node for the same event.
+- **Node signing:** each of the 4 nodes holds its own ML-DSA-65 keypair (`ledger/nodeN/node_mldsa_*.b64`) and signs a canonical core of every entry. Node signatures differ per node for the same event. In `BOUND_LEDGER_MODE=lan` the keypair lives on a separate device and never leaves it.
 - **Checkpoints:** every append also writes a signed checkpoint containing a binary Merkle root over all entry hashes (`checkpoints.jsonl`).
 - **Quorum:** commits require at least 3 of 4 nodes; verification exposes `quorum`, `quorum_ok`, `merkle_root`, and `divergent_nodes`.
 - **Attribution resilience:** `verify_entry_quorum(watermark_id)` proves the record exists identically on >= 3 valid nodes. An investigator can still attribute when one node is corrupted.
 - **Admin tampering:** rewriting all four node files consistently and recomputing every hash still fails, because `node_signature` values cannot be forged without the node private keys. This is covered by a test and a demo endpoint.
+
+---
+
+## LAN / Air-Gapped Multi-Device Mode
+
+By default the four ledger nodes are four directories written by one process (`BOUND_LEDGER_MODE=local`). Set `BOUND_LEDGER_MODE=lan` to run each node as its own service on its own device behind an isolated router with **no uplink**.
+
+```
+        ISOLATED WIFI ROUTER (no Ethernet / WAN uplink)
+   Coordinator (app+frontend) ──HTTP── node1 ── node2 ── node3 ── node4
+                                      (one device + one keypair each)
+```
+
+**Why it matters:** each node's ML-DSA private key is generated on and never leaves its own device, so a privileged admin with access to the coordinator (or to any single node) cannot forge a consistent rewrite of all four chains — the requirement the single-process mode could not fully meet.
+
+### 1. Network
+- Router with no Ethernet/WAN cable; disable client/AP isolation so devices can talk to each other.
+- Give each device a static IP (e.g. coordinator `192.168.50.10`, nodes `.11`–`.14`). No DNS needed.
+
+### 2. Start one node per device
+On each of the four node devices, from the repo:
+```bash
+BOUND_NODE_ID=node1 BOUND_NODE_PORT=9101 ./scripts/start_node.sh
+# node2/9102, node3/9103, node4/9104 on the other devices
+```
+First start generates that node's keypair locally. Confirm with `curl http://<device-ip>:9101/node/info` (only the **public** key is ever returned).
+
+### 3. Point the coordinator at the nodes
+On the coordinator device:
+```bash
+cp nodes.example.json nodes.json     # edit the four URLs
+export BOUND_LEDGER_MODE=lan
+export BOUND_NODES_CONFIG="$PWD/nodes.json"
+uv run uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
+```
+Files, Shared with me, Verify and Audit are unchanged — the ledger layer switches transport transparently.
+
+### Node API (plain HTTP on the isolated LAN)
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/health`, `/node/info` | liveness; public key + chain head |
+| GET | `/node/entries` | full chain (used for peer sync) |
+| GET | `/node/find?watermark_id=` | entry + chain-prefix validity |
+| POST | `/node/append` | coordinator proposes; node independently validates then signs |
+| POST | `/node/verify` | node self-verifies chain + Merkle checkpoints |
+| POST | `/node/sync` | adopt a peer's canonical chain, re-signing every entry locally |
+
+### Failure behaviour
+- **One node down** → 3/4 quorum still commits and attributes (`backend/tests/test_ledger_lan.py`).
+- **A node edited on its device** → `verify_all_ledgers` flags it; `repair_divergent_nodes` re-syncs it peer-to-peer, re-signing locally (it is never overwritten from a trusted file copy).
+- **Fewer than 3 nodes reachable** → commits refuse.
+
+> Plain HTTP is intentional: the air-gapped router is the security boundary. For a stronger transport, terminate TLS locally with a self-signed CA.
 
 ---
 
@@ -223,6 +276,7 @@ uv run pytest backend/tests -q
 - `test_ledger_v2.py` — per-node signatures, checkpoints, single-node tamper vs. all-node consistent tamper, quorum.
 - `test_auth.py` — registration, encrypted keys, wrong passphrase, unlock, sessions, legacy demo users.
 - `test_api_integration.py` — full HTTP flow: username availability, register/login, encrypt, role-filtered documents, document events, locked-decrypt 403, unlock, decrypt, signed download, ledger repair from quorum, admin-tamper demo, forensic verify, logout — including multi-format upload, decrypt, and verify coverage.
+- `test_ledger_lan.py` — spins four real node-agent processes on localhost and exercises LAN mode: commit + full verification, per-entry 3/4 quorum, divergence detection, and peer-to-peer repair with local re-signing.
 
 ---
 
@@ -234,7 +288,7 @@ uv run pytest backend/tests -q
 
 **Known limitations (must be stated honestly):**
 
-- Node private keys currently sit next to the ledger files. An attacker with both file access and those key files can still forge. Production would separate node keys onto distinct hosts/HSMs with independent permissions. The implemented design detects an admin who has file access but not node keys.
+- In the default `local` mode the four node private keys sit next to the ledger files; an attacker with both file access and those key files can still forge. Run `BOUND_LEDGER_MODE=lan` (see below) so each node's key is generated on and stays on its own device — that is the configuration intended to satisfy the "no single administrator" requirement. Production would add HSMs / independent host permissions.
 - For encrypted accounts, private keys are held by the server process after unlock. The signature is produced server-side on the recipient's behalf, which weakens true non-repudiation. Full non-repudiation requires client-side signing (liboqs/WASM in the browser or a local key agent) or a hardware token.
 - The two demo accounts (ALICE/BOB) keep legacy plaintext keys for compatibility with the demo flows. New accounts use encrypted keys.
 - Watermarking does not survive print/scan, photography, screenshot with re-typing, or deliberate removal. In the default `preserve` mode it survives normal PDF copies and re-saves (invisible text channel) and JPEG re-encoding of embedded images (DCT channel); a leak flattened to a single bare image loses the text channel. Use `mode="rasterize"` when full-page DCT robustness matters more than text selection.

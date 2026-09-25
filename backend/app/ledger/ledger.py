@@ -32,8 +32,26 @@ from backend.app.crypto.pqcrypto_wrapper import (
 from backend.app.forensic.events import canonical_serialize
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[3]
-LEDGER_ROOT = PROJECT_ROOT / "ledger"
+# `BOUND_LEDGER_ROOT` lets a per-device node agent run this exact code against
+# its own data directory. Local (single-process) mode leaves it unset.
+LEDGER_ROOT = pathlib.Path(
+    os.environ.get("BOUND_LEDGER_ROOT", str(PROJECT_ROOT / "ledger"))
+)
 NODE_IDS = ["node1", "node2", "node3", "node4"]
+
+
+def ledger_mode() -> str:
+    """
+    "local" (default): four node directories written by this process.
+    "lan": the four nodes are remote services on separate devices, reached over
+    the isolated LAN via backend.app.ledger.lan.
+    """
+    return os.environ.get("BOUND_LEDGER_MODE", "local").strip().lower()
+
+
+def _dispatch_lan():
+    from backend.app.ledger import lan as _lan
+    return _lan
 GENESIS_PREV_HASH = "0" * 64
 
 QUORUM_SIZE = 3
@@ -383,6 +401,8 @@ def verify_all_ledgers() -> Tuple[bool, Dict]:
     Strict overall validity: ALL 4 nodes valid AND all chains identical in
     length and last hash. Per-node details plus quorum/merkle/divergence info.
     """
+    if ledger_mode() == "lan":
+        return _dispatch_lan().verify_all_ledgers()
     results: Dict = {}
     valid_nodes: List[str] = []
     chain_meta: Dict[str, Tuple[int, str]] = {}
@@ -440,6 +460,8 @@ def verify_entry_quorum(watermark_id: str) -> Dict:
     valid node_signature, and each of those node chains valid up to that seq.
     A single corrupt node therefore cannot destroy attribution.
     """
+    if ledger_mode() == "lan":
+        return _dispatch_lan().verify_entry_quorum(watermark_id)
     result = {
         "quorum_ok": False,
         "valid_nodes": [],
@@ -519,6 +541,8 @@ def commit_event(event: Dict, signature_b64: str, public_key_b64: str) -> Dict:
     hash equals previous_hash. Each participating node stores its own line
     (distinct node_id + node_signature) and a signed Merkle checkpoint.
     """
+    if ledger_mode() == "lan":
+        return _dispatch_lan().commit_event(event, signature_b64, public_key_b64)
     _ensure_ledger_dirs()
     canon = canonical_serialize(event)
 
@@ -574,6 +598,8 @@ def repair_divergent_nodes() -> Dict:
     repaired node re-signs every canonical entry with its own ML-DSA key and
     rebuilds its signed Merkle checkpoints. Refuses to act without a quorum.
     """
+    if ledger_mode() == "lan":
+        return _dispatch_lan().repair_divergent_nodes()
     _, details = verify_all_ledgers()
     valid_nodes = [nid for nid in NODE_IDS if details.get(nid, {}).get("valid")]
     before = {nid: bool(details.get(nid, {}).get("valid")) for nid in NODE_IDS}
@@ -659,9 +685,13 @@ def get_all_entries() -> List[Dict]:
     Return consolidated ledger entries (node1 as primary).
     For display, we use node1's ledger.
     """
+    if ledger_mode() == "lan":
+        return _dispatch_lan().get_all_entries()
     return _load_entries("node1")
 
 def get_entries_from_all_nodes() -> Dict[str, List[Dict]]:
+    if ledger_mode() == "lan":
+        return _dispatch_lan().get_entries_from_all_nodes()
     return {nid: _load_entries(nid) for nid in NODE_IDS}
 
 def find_by_watermark(watermark_id: str) -> Optional[Dict]:
@@ -669,6 +699,8 @@ def find_by_watermark(watermark_id: str) -> Optional[Dict]:
     Search ledger for matching watermark_id.
     Searches node1's ledger first, then the other nodes.
     """
+    if ledger_mode() == "lan":
+        return _dispatch_lan().find_by_watermark(watermark_id)
     entries = _load_entries("node1")
     for e in entries:
         if e.get("watermark_id") == watermark_id:
@@ -686,6 +718,8 @@ def find_by_watermark(watermark_id: str) -> Optional[Dict]:
     return None
 
 def find_by_document(document_id: str) -> List[Dict]:
+    if ledger_mode() == "lan":
+        return _dispatch_lan().find_by_document(document_id)
     entries = _load_entries("node1")
     return [e for e in entries if e.get("document_id") == document_id]
 
