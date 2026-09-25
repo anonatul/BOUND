@@ -261,10 +261,17 @@ BOUND_COORDINATOR_URL=http://192.168.50.10:8000 \
 BOUND_ENROLL_TOKEN="pick-a-shared-secret" \
 ./scripts/start_node.sh
 ```
-On Windows PowerShell:
+On Windows PowerShell (keep each command on its own line; do **not** join them):
 ```powershell
-.\scripts\start_node.ps1 -NodeId laptopB -Port 9101 `
-  -CoordinatorUrl http://192.168.50.10:8000
+cd $HOME\Documents\BOUND
+.\scripts\start_node.ps1 -NodeId laptopB -Port 9101 -CoordinatorUrl http://192.168.50.10:8000
+```
+If the script gives trouble, run the node directly without it (same thing):
+```powershell
+$env:BOUND_NODE_ID = "laptopB"
+$env:BOUND_NODE_PORT = "9101"
+$env:BOUND_COORDINATOR_URL = "http://192.168.50.10:8000"
+uv run uvicorn backend.app.ledger.node_agent:app --host 0.0.0.0 --port 9101
 ```
 First start generates that node's keypair locally, then it announces itself and is added automatically. Confirm with `curl http://<device-ip>:9101/node/info` (only the **public** key is ever returned) and check membership with `curl http://192.168.50.10:8000/api/ledger/members`.
 

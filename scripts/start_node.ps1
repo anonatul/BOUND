@@ -1,18 +1,27 @@
 # Run one BOUND ledger node on this Windows device and auto-join it.
 #
-#   .\scripts\start_node.ps1 -NodeId node3 -Port 9103 `
-#        -CoordinatorUrl http://192.168.50.10:8000
+#   .\scripts\start_node.ps1 -NodeId laptopB -Port 9101 -CoordinatorUrl http://192.168.50.10:8000
+#
+# Values may also come from environment variables (BOUND_NODE_ID,
+# BOUND_NODE_PORT, BOUND_COORDINATOR_URL), so running the script with no
+# arguments works after setting them.
 #
 # The node generates its ML-DSA-65 keypair on first start and keeps the private
 # key on this device only. It announces itself to the coordinator, which adds it
 # as a member witness. No internet needed; plain HTTP on the isolated LAN.
 param(
-    [Parameter(Mandatory = $true)][string]$NodeId,
-    [int]$Port = 9101,
+    [string]$NodeId = "",
+    [int]$Port = 0,
     [string]$CoordinatorUrl = ""
 )
 
 $ErrorActionPreference = "Stop"
+
+if (-not $NodeId) { $NodeId = $env:BOUND_NODE_ID }
+if (-not $NodeId) { throw "Set -NodeId <name> (or `$env:BOUND_NODE_ID) for this device." }
+if ($Port -le 0) { $Port = if ($env:BOUND_NODE_PORT) { [int]$env:BOUND_NODE_PORT } else { 9101 } }
+if (-not $CoordinatorUrl) { $CoordinatorUrl = $env:BOUND_COORDINATOR_URL }
+
 Set-Location (Join-Path $PSScriptRoot "..")
 
 $env:BOUND_NODE_ID = $NodeId
