@@ -77,18 +77,22 @@ def lan_cluster(tmp_path_factory):
         )
         pytest.skip(f"could not start node agents on localhost\n{detail}")
 
-    config = {
-        "quorum": 3,
-        "timeout": 5,
-        "nodes": [
-            {"id": nid, "url": f"http://127.0.0.1:{port}"}
-            for nid, port in zip(NODE_IDS, PORTS)
-        ],
-    }
-    config_path = root / "nodes.json"
-    config_path.write_text(json.dumps(config))
+    # Register the members directly (equivalent to each node announcing itself
+    # to the coordinator over the LAN).
+    from backend.app.ledger import members as members_mod
 
-    yield {"root": root, "config": config_path}
+    members_file = root / "members.json"
+    previous_members_file = os.environ.get("BOUND_MEMBERS_FILE")
+    os.environ["BOUND_MEMBERS_FILE"] = str(members_file)
+    for nid, port in zip(NODE_IDS, PORTS):
+        members_mod.add_member(nid, f"http://127.0.0.1:{port}")
+
+    yield {"root": root, "members_file": members_file, "ports": dict(zip(NODE_IDS, PORTS))}
+
+    if previous_members_file is None:
+        os.environ.pop("BOUND_MEMBERS_FILE", None)
+    else:
+        os.environ["BOUND_MEMBERS_FILE"] = previous_members_file
 
     for p in procs:
         p.terminate()
@@ -107,9 +111,7 @@ def lan_cluster(tmp_path_factory):
 @pytest.fixture
 def lan_mode(lan_cluster, monkeypatch):
     monkeypatch.setenv("BOUND_LEDGER_MODE", "lan")
-    monkeypatch.setenv("BOUND_NODES_CONFIG", str(lan_cluster["config"]))
-    from backend.app.ledger import lan
-    lan.CONFIG_PATH = lan_cluster["config"]
+    monkeypatch.setenv("BOUND_MEMBERS_FILE", str(lan_cluster["members_file"]))
     return lan_cluster
 
 

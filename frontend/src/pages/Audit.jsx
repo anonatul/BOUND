@@ -89,7 +89,7 @@ export function Audit({ focus, onFocusHandled, ledgerVersion }) {
   const nodeNames = useMemo(
     () =>
       Object.keys(details)
-        .filter((name) => /^node\d+$/.test(name))
+        .filter((name) => details[name] && typeof details[name] === 'object' && 'valid' in details[name])
         .sort(),
     [details]
   )
@@ -396,7 +396,7 @@ export function Audit({ focus, onFocusHandled, ledgerVersion }) {
                 <p className="stat-label">
                   Quorum{' '}
                   <InfoTip label="quorum">
-                    Every event is written to all four ledger nodes. A record is accepted when at
+                    Every event is written to every registered witness node. A record is accepted when at
                     least three nodes agree, so one faulty or tampered node cannot rewrite the
                     recorded history.
                   </InfoTip>

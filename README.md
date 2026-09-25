@@ -202,64 +202,98 @@ docker compose up --build
 
 - **Entry:** `{seq, event, signature (recipient), public_key_b64, previous_hash, current_hash, timestamp, node_id, node_signature, denormalized document/recipient/session/watermark ids}`.
 - `current_hash = SHA256(canonical_event + recipient_signature + previous_hash)`.
-- **Node signing:** each of the 4 nodes holds its own ML-DSA-65 keypair (`ledger/nodeN/node_mldsa_*.b64`) and signs a canonical core of every entry. Node signatures differ per node for the same event. In `BOUND_LEDGER_MODE=lan` the keypair lives on a separate device and never leaves it.
+- **Node signing:** each node holds its own ML-DSA-65 keypair (`ledger/nodeN/node_mldsa_*.b64`) and signs a canonical core of every entry. Node signatures differ per node for the same event. In `BOUND_LEDGER_MODE=lan` the keypair lives on a separate device and never leaves it.
 - **Checkpoints:** every append also writes a signed checkpoint containing a binary Merkle root over all entry hashes (`checkpoints.jsonl`).
-- **Quorum:** commits require at least 3 of 4 nodes; verification exposes `quorum`, `quorum_ok`, `merkle_root`, and `divergent_nodes`.
-- **Attribution resilience:** `verify_entry_quorum(watermark_id)` proves the record exists identically on >= 3 valid nodes. An investigator can still attribute when one node is corrupted.
-- **Admin tampering:** rewriting all four node files consistently and recomputing every hash still fails, because `node_signature` values cannot be forged without the node private keys. This is covered by a test and a demo endpoint.
+- **Quorum:** in local mode, at least 3 of 4 nodes; in LAN mode, a strict majority of registered member devices. Verification exposes `quorum`, `quorum_ok`, `merkle_root`, and `divergent_nodes`.
+- **Attribution resilience:** `verify_entry_quorum(watermark_id)` proves the record exists identically on a valid quorum of nodes. An investigator can still attribute when one node is corrupted.
+- **Admin tampering:** rewriting every node's files consistently and recomputing every hash still fails, because `node_signature` values cannot be forged without the node private keys. In LAN mode those keys are on separate devices, which is what makes the guarantee hold against a privileged coordinator.
 
 ---
 
 ## LAN / Air-Gapped Multi-Device Mode
 
-By default the four ledger nodes are four directories written by one process (`BOUND_LEDGER_MODE=local`). Set `BOUND_LEDGER_MODE=lan` to run each node as its own service on its own device behind an isolated router with **no uplink**.
+By default the ledger is four directories written by one process (`BOUND_LEDGER_MODE=local`). Set `BOUND_LEDGER_MODE=lan` to spread the ledger across **whatever real devices you put on the isolated LAN**. There is no fixed node count and no IP list to edit: each device runs the node agent and **announces itself to the coordinator**, which adds it as a member.
 
 ```
         ISOLATED WIFI ROUTER (no Ethernet / WAN uplink)
-   Coordinator (app+frontend) ──HTTP── node1 ── node2 ── node3 ── node4
-                                      (one device + one keypair each)
+   Coordinator (app+frontend) ◄── auto-join ── laptop B
+           │                                  laptop C
+           └── HTTP ── every member device runs one node agent
 ```
 
-**Why it matters:** each node's ML-DSA private key is generated on and never leaves its own device, so a privileged admin with access to the coordinator (or to any single node) cannot forge a consistent rewrite of all four chains — the requirement the single-process mode could not fully meet.
+**Why it matters:** each node's ML-DSA private key is generated on and never leaves its own device, so a privileged admin with access to the coordinator (or to any single node) cannot forge a consistent rewrite of the whole chain.
+
+### Quorum rule: a majority of members
+
+The threshold depends on how many devices have joined, **not** on how many are online:
+
+| Members | Quorum |
+|---|---|
+| 1 | 1 |
+| 2 | 2 |
+| 3 | 2 |
+| 4 | 3 |
+| 5 | 3 |
+| 6 | 4 |
+
+Because the threshold is fixed by membership, a coordinator that can knock nodes off the network cannot shrink the requirement and forge a record. A node going offline is reported unreachable; it is not silently dropped from the member list.
+
+> With 2 devices, the split is 1 node each and quorum 2 — **both must be online** to record, and neither alone can forge. Add more laptops and the quorum scales automatically.
 
 ### 1. Network
 - Router with no Ethernet/WAN cable; disable client/AP isolation so devices can talk to each other.
-- Give each device a static IP (e.g. coordinator `192.168.50.10`, nodes `.11`–`.14`). No DNS needed.
+- Give each device a static IP (e.g. coordinator `192.168.50.10`). No DNS needed.
 
-### 2. Start one node per device
-On each of the four node devices, from the repo:
-```bash
-BOUND_NODE_ID=node1 BOUND_NODE_PORT=9101 ./scripts/start_node.sh
-# node2/9102, node3/9103, node4/9104 on the other devices
-```
-First start generates that node's keypair locally. Confirm with `curl http://<device-ip>:9101/node/info` (only the **public** key is ever returned).
-
-### 3. Point the coordinator at the nodes
+### 2. Start the coordinator
 On the coordinator device:
 ```bash
-cp nodes.example.json nodes.json     # edit the four URLs
 export BOUND_LEDGER_MODE=lan
-export BOUND_NODES_CONFIG="$PWD/nodes.json"
+export BOUND_ENROLL_TOKEN="pick-a-shared-secret"   # optional: gates who may join
 uv run uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
 ```
-Files, Shared with me, Verify and Audit are unchanged — the ledger layer switches transport transparently.
 
-### Node API (plain HTTP on the isolated LAN)
+### 3. Start one node per witness device
+On each other device, from the repo:
+```bash
+BOUND_NODE_ID=laptopB \
+BOUND_NODE_PORT=9101 \
+BOUND_COORDINATOR_URL=http://192.168.50.10:8000 \
+BOUND_ENROLL_TOKEN="pick-a-shared-secret" \
+./scripts/start_node.sh
+```
+On Windows PowerShell:
+```powershell
+.\scripts\start_node.ps1 -NodeId laptopB -Port 9101 `
+  -CoordinatorUrl http://192.168.50.10:8000
+```
+First start generates that node's keypair locally, then it announces itself and is added automatically. Confirm with `curl http://<device-ip>:9101/node/info` (only the **public** key is ever returned) and check membership with `curl http://192.168.50.10:8000/api/ledger/members`.
+
+### 4. Use the app
+Files, Shared with me, Verify and Audit are unchanged — the ledger layer switches transport transparently. The Audit view shows the live members, the required quorum, and any divergent node.
+
+### Membership & Node API (plain HTTP on the isolated LAN)
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health`, `/node/info` | liveness; public key + chain head |
+| POST | `/api/ledger/register` | a node announces itself (id, port, public key); the coordinator derives its URL from the observed source IP and adds it as a member |
+| GET | `/api/ledger/members` | registered member devices + current quorum |
+| DELETE | `/api/ledger/members/{id}` | remove a member |
+| GET | `/health`, `/node/info` | node liveness; public key + chain head |
 | GET | `/node/entries` | full chain (used for peer sync) |
 | GET | `/node/find?watermark_id=` | entry + chain-prefix validity |
 | POST | `/node/append` | coordinator proposes; node independently validates then signs |
 | POST | `/node/verify` | node self-verifies chain + Merkle checkpoints |
 | POST | `/node/sync` | adopt a peer's canonical chain, re-signing every entry locally |
 
+A newly joined node is seeded with the existing chain automatically. The public key is pinned on first join: re-announcing with a different key is rejected.
+
 ### Failure behaviour
-- **One node down** → 3/4 quorum still commits and attributes (`backend/tests/test_ledger_lan.py`).
+- **One node down (of 4+)** → the majority quorum still commits and attributes (`backend/tests/test_ledger_lan.py`).
 - **A node edited on its device** → `verify_all_ledgers` flags it; `repair_divergent_nodes` re-syncs it peer-to-peer, re-signing locally (it is never overwritten from a trusted file copy).
-- **Fewer than 3 nodes reachable** → commits refuse.
+- **Fewer than the quorum reachable** → commits refuse.
 
 > Plain HTTP is intentional: the air-gapped router is the security boundary. For a stronger transport, terminate TLS locally with a self-signed CA.
+>
+> The local-only "tampering" demo endpoints return `skipped` in LAN mode, because the nodes live on separate devices; tamper with a node there and the Audit view flags it.
 
 ---
 
@@ -276,7 +310,8 @@ uv run pytest backend/tests -q
 - `test_ledger_v2.py` — per-node signatures, checkpoints, single-node tamper vs. all-node consistent tamper, quorum.
 - `test_auth.py` — registration, encrypted keys, wrong passphrase, unlock, sessions, legacy demo users.
 - `test_api_integration.py` — full HTTP flow: username availability, register/login, encrypt, role-filtered documents, document events, locked-decrypt 403, unlock, decrypt, signed download, ledger repair from quorum, admin-tamper demo, forensic verify, logout — including multi-format upload, decrypt, and verify coverage.
-- `test_ledger_lan.py` — spins four real node-agent processes on localhost and exercises LAN mode: commit + full verification, per-entry 3/4 quorum, divergence detection, and peer-to-peer repair with local re-signing.
+- `test_ledger_lan.py` — spins four real node-agent processes on localhost and exercises LAN mode: commit + full verification, per-entry majority quorum, divergence detection, and peer-to-peer repair with local re-signing.
+- `test_members.py` — dynamic membership: strict-majority quorum table, add/list/remove, public-key pinning, and URL refresh on re-announce.
 
 ---
 

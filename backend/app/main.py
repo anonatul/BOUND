@@ -10,7 +10,7 @@ import time
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -34,11 +34,14 @@ from backend.app.identity.manager import (
     unlock_expiry,
     unlock_user,
 )
+from backend.app.ledger import lan as lan_client
+from backend.app.ledger import members as ledger_members
 from backend.app.ledger.ledger import (
     NODE_IDS,
     find_by_document,
     get_entries_from_all_nodes,
     get_ledger_for_display,
+    ledger_mode,
     repair_divergent_nodes,
     verify_all_ledgers,
     verify_entry_quorum,
@@ -548,8 +551,89 @@ async def ledger_endpoint():
         "quorum": details.get("quorum"),
         "quorum_ok": details.get("quorum_ok"),
         "merkle_root": details.get("merkle_root"),
+        "divergent_nodes": details.get("divergent_nodes", []),
         "details": details,
-        "note": "Four independently ML-DSA-signed nodes with Merkle checkpoints; quorum 3/4.",
+        "mode": ledger_mode(),
+        "members": len(ledger_members.load_members()),
+        "note": (
+            "Witness logs are each ML-DSA-signed with Merkle checkpoints; "
+            f"quorum is a majority of the {len(ledger_members.load_members())} "
+            f"registered member device(s)."
+            if ledger_mode() == "lan"
+            else "Four locally ML-DSA-signed nodes with Merkle checkpoints; quorum 3/4."
+        ),
+    }
+
+
+# --- LAN membership (dynamic witness devices) ---
+
+class RegisterRequest(BaseModel):
+    node_id: str
+    port: int
+    public_key_b64: Optional[str] = None
+    token: Optional[str] = None
+
+
+@app.post("/api/ledger/register")
+async def ledger_register(payload: RegisterRequest, request: Request):
+    """
+    A node agent announces itself; it joins the ledger as a witness device.
+
+    The URL is derived from the caller's observed source IP plus its advertised
+    port, so a node cannot claim an address that is not its own. The public key
+    is pinned on first join. An optional enrollment token gates registration.
+    """
+    expected_token = os.environ.get("BOUND_ENROLL_TOKEN", "").strip()
+    if expected_token and payload.token != expected_token:
+        raise HTTPException(status_code=403, detail="invalid enrollment token")
+
+    node_id = (payload.node_id or "").strip()
+    if not node_id:
+        raise HTTPException(status_code=400, detail="node_id is required")
+
+    host = request.client.host if request.client else None
+    if not host:
+        raise HTTPException(status_code=400, detail="cannot determine caller address")
+    url = f"http://{host}:{int(payload.port)}"
+
+    entries = lan_client.canonical_entries()
+    try:
+        member = ledger_members.add_member(node_id, url, payload.public_key_b64)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    seeded = lan_client.maybe_sync(url, entries)
+    return {
+        "registered": True,
+        "member": member,
+        "members": len(ledger_members.load_members()),
+        "quorum": ledger_members.current_quorum(),
+        "seeded_entries": len(entries),
+        "sync": seeded,
+    }
+
+
+@app.get("/api/ledger/members")
+async def ledger_members_endpoint():
+    members = ledger_members.load_members()
+    return {
+        "mode": ledger_mode(),
+        "count": len(members),
+        "quorum": ledger_members.current_quorum(),
+        "quorum_rule": "strict majority of registered members",
+        "members": members,
+    }
+
+
+@app.delete("/api/ledger/members/{node_id}")
+async def ledger_remove_member(node_id: str):
+    removed = ledger_members.remove_member(node_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"member {node_id} not found")
+    return {
+        "removed": node_id,
+        "count": len(ledger_members.load_members()),
+        "quorum": ledger_members.current_quorum(),
     }
 
 
@@ -693,6 +777,19 @@ async def test_ledger_tampering():
 
     from backend.app.ledger.ledger import _load_entries
 
+    if ledger_mode() == "lan":
+        return {
+            "test": "Ledger Tampering (single node)",
+            "skipped": True,
+            "passed": None,
+            "note": (
+                "This demo edits local ledger files and only applies to "
+                "BOUND_LEDGER_MODE=local. In LAN mode each node owns its file on "
+                "its own device; tamper with it there and the Audit view will flag "
+                "the node, then 'Re-sync from quorum' repairs it."
+            ),
+        }
+
     valid_before, _ = verify_all_ledgers()
     ledger_path = PROJECT_ROOT / "ledger" / "node1" / "ledger.jsonl"
     original_content = ledger_path.read_text(encoding="utf-8") if ledger_path.exists() else ""
@@ -731,6 +828,19 @@ async def test_ledger_admin_tampering():
     """
     from backend.app.forensic.events import canonical_serialize
     from backend.app.ledger.ledger import _compute_current_hash, _ledger_path, _load_entries
+
+    if ledger_mode() == "lan":
+        return {
+            "test": "Privileged Admin Tampering (consistent rewrite)",
+            "skipped": True,
+            "passed": None,
+            "note": (
+                "This demo rewrites the local four-node files and only applies to "
+                "BOUND_LEDGER_MODE=local. In LAN mode the equivalent attack means "
+                "holding every node's private key on every device, which the "
+                "membership design prevents."
+            ),
+        }
 
     entries0 = _load_entries("node1")
     if not entries0:

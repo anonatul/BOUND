@@ -36,9 +36,9 @@ backend/data/
 # Keep ledger structure
 !ledger/*/.gitkeep
 
-# LAN mode runtime artifacts (per-device node data + real device IPs)
+# LAN mode runtime artifacts (per-device node data + registered members)
 ledger-lan/
-nodes.json
+ledger-members.json
 
 # Keys (demo keys regenerated on startup; don't commit private keys)
 backend/keys/*.b64

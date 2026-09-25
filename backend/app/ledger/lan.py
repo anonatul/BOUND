@@ -6,23 +6,13 @@ isolated LAN, using only the Python standard library (no new dependencies, no
 cloud, works fully offline). Implements the same public surface as the local
 file ledger so `backend.app.ledger.ledger` can dispatch to it transparently.
 
-Configuration (default `nodes.json` at the project root, override with
-`BOUND_NODES_CONFIG`):
-
-    {
-      "quorum": 3,
-      "timeout": 5,
-      "nodes": [
-        {"id": "node1", "url": "http://192.168.50.11:9101"},
-        {"id": "node2", "url": "http://192.168.50.12:9101"},
-        {"id": "node3", "url": "http://192.168.50.13:9101"},
-        {"id": "node4", "url": "http://192.168.50.14:9101"}
-      ]
-    }
+Membership is dynamic: any device that runs the node agent and announces itself
+to the coordinator becomes a member (see `members.py`). The quorum is a
+majority of registered members, so the number of witnesses is however many real
+devices joined -- not a fixed four.
 """
 import json
 import os
-import pathlib
 import time
 import urllib.error
 import urllib.parse
@@ -31,31 +21,22 @@ from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
 from backend.app.forensic.events import canonical_serialize
-from backend.app.ledger import ledger
+from backend.app.ledger import ledger, members
 
-CONFIG_PATH = pathlib.Path(
-    os.environ.get("BOUND_NODES_CONFIG", str(ledger.PROJECT_ROOT / "nodes.json"))
-)
 GENESIS_PREV_HASH = ledger.GENESIS_PREV_HASH
 
 
-def _config() -> Dict:
-    try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {"quorum": 3, "timeout": 5, "nodes": []}
+def _timeout() -> float:
+    return float(os.environ.get("BOUND_LAN_TIMEOUT", "5"))
 
 
 def _nodes() -> List[Dict]:
-    return list(_config().get("nodes", []))
+    """Registered member devices, as {id, url, public_key_b64, ...}."""
+    return members.load_members()
 
 
 def _quorum() -> int:
-    return int(_config().get("quorum", 3))
-
-
-def _timeout() -> float:
-    return float(_config().get("timeout", 5))
+    return members.current_quorum()
 
 
 def _http(method: str, url: str, payload: Optional[Dict] = None) -> Dict:
@@ -76,6 +57,45 @@ def _try(method: str, url: str, payload: Optional[Dict] = None) -> Optional[Dict
 
 def _base(node: Dict) -> str:
     return str(node["url"]).rstrip("/")
+
+
+def sync_member(url: str, entries: List[Dict]) -> Optional[Dict]:
+    """Push a canonical chain to a member so it re-signs and adopts it locally."""
+    if not entries:
+        return None
+    return _try("POST", str(url).rstrip("/") + "/node/sync", {"entries": entries})
+
+
+def member_info(url: str) -> Optional[Dict]:
+    return _try("GET", str(url).rstrip("/") + "/node/info")
+
+
+def maybe_sync(url: str, entries: List[Dict]) -> Optional[Dict]:
+    """
+    Seed a member that is behind the canonical chain. Skips the transfer when
+    the member already reports at least as many entries (heartbeat case).
+    """
+    if not entries:
+        return None
+    info = member_info(url)
+    if info and int(info.get("count", 0)) >= len(entries):
+        return {"synced": False, "reason": "already up to date"}
+    return sync_member(url, entries)
+
+
+def canonical_entries() -> List[Dict]:
+    """
+    Longest non-empty chain reachable from the current members. Used to seed a
+    newly joined device so it starts from the existing history.
+    """
+    best: List[Dict] = []
+    for node in _nodes():
+        result = _try("GET", _base(node) + "/node/entries")
+        if result:
+            entries = result.get("entries", [])
+            if len(entries) > len(best):
+                best = entries
+    return best
 
 
 def node_infos() -> List[Dict]:

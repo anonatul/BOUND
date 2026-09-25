@@ -14,8 +14,13 @@ Each device on the isolated network runs one instance of this app. The node:
 
 Run one node per device:
 
-    BOUND_NODE_ID=node1 BOUND_LEDGER_ROOT=/srv/bound-node \
-      uv run uvicorn backend.app.ledger.node_agent:app --host 0.0.0.0 --port 9101
+    BOUND_NODE_ID=node1 BOUND_COORDINATOR_URL=http://192.168.50.10:8000 \
+      BOUND_NODE_PORT=9101 uv run uvicorn \
+      backend.app.ledger.node_agent:app --host 0.0.0.0 --port 9101
+
+The node generates its ML-DSA-65 keypair on first start, keeps the private key
+on that device only, and announces itself (id + public key) to the coordinator
+so it joins the ledger automatically. Re-announces periodically as a heartbeat.
 
 Plain HTTP is intentional: the isolated LAN (router with no uplink) is the
 security boundary.
@@ -23,16 +28,22 @@ security boundary.
 import json
 import os
 import pathlib
+import threading
 import time
+import urllib.request
 from typing import Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 from backend.app.forensic.events import canonical_serialize
 from backend.app.ledger import ledger
 
 NODE_ID = os.environ.get("BOUND_NODE_ID", "node1").strip() or "node1"
+COORDINATOR_URL = os.environ.get("BOUND_COORDINATOR_URL", "").strip().rstrip("/")
+ENROLL_TOKEN = os.environ.get("BOUND_ENROLL_TOKEN", "").strip()
+NODE_PORT = int(os.environ.get("BOUND_NODE_PORT", "9101"))
+HEARTBEAT_SECONDS = float(os.environ.get("BOUND_HEARTBEAT_SECONDS", "30"))
 
 app = FastAPI(title=f"BOUND Ledger Node {NODE_ID}")
 
@@ -220,3 +231,51 @@ def sync(req: SyncRequest) -> Dict:
         "".join(json.dumps(c) + "\n" for c in checkpoints), encoding="utf-8"
     )
     return {"node_id": NODE_ID, "synced": True, "count": len(rebuilt)}
+
+
+# ---------------------------------------------------------------------------
+# self-registration with the coordinator (auto-join the ledger)
+# ---------------------------------------------------------------------------
+
+def _announce_once() -> Optional[Dict]:
+    """Tell the coordinator who we are and where we listen. Returns its reply."""
+    if not COORDINATOR_URL:
+        return None
+    pk = _ensure_local_keys()
+    payload = {
+        "node_id": NODE_ID,
+        "port": NODE_PORT,
+        "public_key_b64": ledger.b64e(pk),
+    }
+    if ENROLL_TOKEN:
+        payload["token"] = ENROLL_TOKEN
+    request = urllib.request.Request(
+        COORDINATOR_URL + "/api/ledger/register",
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=_announce_timeout()) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _announce_timeout() -> float:
+    try:
+        return float(os.environ.get("BOUND_ANNOUNCE_TIMEOUT", "8"))
+    except ValueError:
+        return 8.0
+
+
+def _heartbeat_loop() -> None:
+    while True:
+        try:
+            _announce_once()
+        except Exception:
+            pass  # coordinator may not be up yet; retry on the next tick
+        time.sleep(HEARTBEAT_SECONDS)
+
+
+@app.on_event("startup")
+def _start_heartbeat() -> None:
+    if COORDINATOR_URL:
+        threading.Thread(target=_heartbeat_loop, daemon=True).start()
